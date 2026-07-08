@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Word 文档扫描预览 — PDF.js</title>
+<!-- PDF.js for full page-rendering control (goToPage) -->
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<!-- marked.js to render Markdown (tables, lists, etc.) -->
+<script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --panel-bg: #111118;
+    --border: #1e1e2e;
+    --text: #c8c8d4;
+    --text-secondary: #8888a0;
+    --accent: #4da6ff;
+    --accent-glow: #4da6ff44;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    height: 100vh; overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+
+  .header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 14px; background: var(--panel-bg);
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .header .logo { font-size: 16px; font-weight: 700; color: var(--accent); white-space: nowrap; }
+  .header .logo span { color: var(--text-secondary); font-weight: 400; }
+  .upload-area { display: flex; align-items: center; gap: 8px; flex: 1; }
+  .upload-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 5px 12px; border-radius: 5px;
+    border: 1.5px dashed var(--border); background: transparent; color: var(--text);
+    cursor: pointer; font-size: 11px; transition: all .2s; white-space: nowrap;
+  }
+  .upload-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-glow); }
+  #fileName {
+    color: var(--text-secondary); font-size: 11px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px;
+  }
+  .header-controls { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+  .speed-label { font-size: 10px; color: var(--text-secondary); white-space: nowrap; }
+  .speed-slider { width: 70px; accent-color: var(--accent); }
+
+  .main { display: flex; flex: 1; overflow: hidden; }
+
+  /* LEFT — PDF page + scan animation */
+  .scanner-panel {
+    flex: 1; display: flex; flex-direction: column;
+    background: var(--panel-bg); border-right: 1px solid var(--border);
+    position: relative; overflow: hidden; min-width: 420px;
+  }
+  .scanner-stage {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    perspective: 1200px; padding: 20px; position: relative; overflow: hidden;
+  }
+  .page-wrap {
+    position: relative; display: flex; align-items: center; justify-content: center;
+    transition: transform .15s ease;
+  }
+  .page-wrap.flipping { animation: pageFlip .3s ease-in-out; }
+  @keyframes pageFlip {
+    0% { transform: rotateY(0deg) scale(1); }
+    35% { transform: rotateY(-24deg) scale(.94); }
+    100% { transform: rotateY(0deg) scale(1); }
+  }
+  #pdfCanvas {
+    background: #fff; border: 1px solid #2a2a3a; border-radius: 2px;
+    box-shadow: 0 6px 30px #00000066, 0 2px 6px #00000044, 0 0 0 10px #0d0d14;
+    max-width: 100%; max-height: 100%;
+  }
+  /* Page stack behind */
+  .page-stack {
+    position: absolute; background: #15151f; border: 1px solid #1e1e2e; border-radius: 2px;
+  }
+  /* Scan line overlay */
+  .scan-overlay {
+    position: absolute; inset: 0; pointer-events: none; z-index: 20; overflow: hidden;
+  }
+  .scan-line {
+    position: absolute; left: 24px; right: 24px; height: 2px;
+    background: linear-gradient(90deg, transparent 0%, rgba(77,166,255,.25) 15%,
+      #4da6ff 30%, #99ccff 50%, #4da6ff 70%, rgba(77,166,255,.25) 85%, transparent 100%);
+    box-shadow: 0 0 6px #4da6ff99, 0 0 20px #4da6ff55, 0 0 50px #4da6ff22;
+    top: 0; opacity: 0;
+  }
+  .scan-line.active { opacity: 1; }
+  .scan-glow {
+    position: absolute; left: 0; right: 0; height: 64px;
+    background: linear-gradient(180deg, transparent 0%, rgba(190,220,255,.32) 40%,
+      rgba(170,210,255,.20) 70%, transparent 100%);
+    top: -32px; opacity: 0;
+  }
+  .particles { position: absolute; inset: 0; }
+  .particle {
+    position: absolute; width: 2px; height: 2px; border-radius: 50%;
+    background: #4da6ff; animation: particleFloat .7s ease-out forwards; opacity: 0;
+  }
+  @keyframes particleFloat {
+    0% { opacity: 1; transform: translate(0,0); }
+    100% { opacity: 0; transform: translate(var(--dx), var(--dy)); }
+  }
+  .sheet-page-num {
+    position: absolute; bottom: 6px; right: 12px; font-size: 10px; color: #999;
+    z-index: 21; font-family: 'Segoe UI', sans-serif;
+  }
+
+  .scanner-bottom {
+    flex-shrink: 0; padding: 7px 14px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  .page-indicator { font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+  .progress-bar-wrap { flex: 1; height: 2px; background: #ffffff10; border-radius: 1px; overflow: hidden; }
+  .progress-bar-fill { height: 100%; background: var(--accent); border-radius: 1px; transition: width .3s ease; width: 0%; }
+
+  /* RIGHT — extracted text */
+  .content-panel { flex: 1; display: flex; flex-direction: column; background: #0d0d14; min-width: 380px; }
+  .content-header {
+    flex-shrink: 0; padding: 9px 16px; border-bottom: 1px solid var(--border);
+    font-size: 11px; color: var(--text-secondary); display: flex; align-items: center; gap: 8px;
+  }
+  .content-header .page-tag {
+    background: var(--accent-glow); color: var(--accent);
+    padding: 2px 9px; border-radius: 3px; font-size: 11px; font-weight: 600; white-space: nowrap;
+  }
+  .content-body { flex: 1; overflow-y: auto; padding: 20px 24px 30px; font-size: 14px; line-height: 1.85; }
+  /* Markdown-rendered content styles */
+  .content-body p { margin: .5em 0; }
+  .content-body h1, .content-body h2, .content-body h3,
+  .content-body h4, .content-body h5, .content-body h6 {
+    color: #fff; font-weight: 600; margin: .8em 0 .4em; line-height: 1.3;
+  }
+  .content-body h1 { font-size: 1.5em; border-bottom: 1px solid #2a2a3a; padding-bottom: 6px; }
+  .content-body h2 { font-size: 1.3em; }
+  .content-body h3 { font-size: 1.15em; }
+  .content-body h4 { font-size: 1.05em; }
+  .content-body ul, .content-body ol { padding-left: 22px; margin: .5em 0; }
+  .content-body li { margin: .25em 0; }
+  .content-body strong { color: #fff; font-weight: 600; }
+  .content-body em { color: #d0d0e0; font-style: italic; }
+  .content-body code {
+    background: #ffffff14; padding: 1px 5px; border-radius: 3px;
+    font-family: 'Consolas', 'Menlo', monospace; font-size: .9em; color: #ffd479;
+  }
+  .content-body pre {
+    background: #111122; padding: 12px 14px; border-radius: 6px; overflow-x: auto;
+    border: 1px solid #1e1e2e; margin: .6em 0;
+  }
+  .content-body pre code { background: none; color: #c8c8d4; padding: 0; }
+  .content-body blockquote {
+    border-left: 3px solid var(--accent); background: #ffffff06;
+    padding: 6px 14px; margin: .6em 0; color: var(--text-secondary);
+  }
+  .content-body hr { border: none; border-top: 1px solid var(--border); margin: 1em 0; }
+  .content-body a { color: var(--accent); text-decoration: none; }
+  .content-body a:hover { text-decoration: underline; }
+  /* Tables — the key feature */
+  .content-body table {
+    border-collapse: collapse; width: 100%; margin: .8em 0;
+    font-size: 12.5px; overflow: hidden; border-radius: 4px;
+  }
+  .content-body table th {
+    background: #1a2a4a; color: #aaccff; font-weight: 600;
+    border: 1px solid #2a3a5a; padding: 7px 10px; text-align: left; white-space: nowrap;
+  }
+  .content-body table td {
+    border: 1px solid #1e1e30; padding: 6px 10px; vertical-align: top;
+  }
+  .content-body table tr:nth-child(even) td { background: #0f0f1e; }
+  .content-body table tr:hover td { background: #161630; }
+  .content-body table tr:last-child td:first-child { white-space: normal; }
+
+  .empty-state {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; color: var(--text-secondary);
+  }
+  .empty-icon { font-size: 48px; opacity: .4; }
+
+  .btn {
+    padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer; font-size: 10px; transition: all .2s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: .3; cursor: not-allowed; }
+
+  .content-body::-webkit-scrollbar { width: 5px; }
+  .content-body::-webkit-scrollbar-track { background: transparent; }
+  .content-body::-webkit-scrollbar-thumb { background: #2a2a3a; border-radius: 3px; }
+
+  @media (max-width: 900px) {
+    .main { flex-direction: column; }
+    .scanner-panel { min-width: unset; height: 55vh; border-right: none; border-bottom: 1px solid var(--border); }
+    .content-panel { min-width: unset; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">📄 Doc<span>Scan</span></div>
+  <div class="upload-area">
+    <label class="upload-btn" for="fileInput">📂 打开 Word 文档</label>
+    <input type="file" id="fileInput" accept=".docx" hidden>
+    <span id="fileName"></span>
+  </div>
+  <div class="header-controls">
+    <span class="speed-label">速度</span>
+    <input type="range" class="speed-slider" id="speedSlider" min="1" max="5" value="3" step="1">
+    <span id="speedDisplay" style="font-size:10px;color:var(--accent);min-width:38px;">1.50s</span>
+    <button class="btn" id="btnPlay" disabled>▶ 开始</button>
+    <button class="btn" id="btnPause" disabled>⏸ 暂停</button>
+    <button class="btn" id="btnReset" disabled>↺ 重置</button>
+    <button class="btn" id="btnExport" disabled title="导出全部页为 Markdown">📥 导出 MD</button>
+  </div>
+</div>
+
+<div class="main">
+  <div class="scanner-panel" id="scannerPanel">
+    <div class="scanner-stage" id="scannerStage">
+      <div class="page-wrap" id="pageWrap">
+        <div class="page-stack" id="stack1"></div>
+        <div class="page-stack" id="stack2"></div>
+        <canvas id="pdfCanvas"></canvas>
+        <div class="scan-overlay">
+          <div class="scan-glow" id="scanGlow"></div>
+          <div class="scan-line" id="scanLine"></div>
+          <div class="particles" id="particles"></div>
+        </div>
+        <div class="sheet-page-num" id="sheetPageNum"></div>
+      </div>
+    </div>
+    <div class="scanner-bottom">
+      <span class="page-indicator" id="pageIndicator">等待加载文档…</span>
+      <div class="progress-bar-wrap"><div class="progress-bar-fill" id="progressBar"></div></div>
+    </div>
+  </div>
+
+  <div class="content-panel">
+    <div class="content-header">
+      📋 <span>提取内容</span>
+      <span class="page-tag" id="contentPageTag" style="display:none;"></span>
+    </div>
+    <div class="content-body" id="contentBody">
+      <div class="empty-state">
+        <div class="empty-icon">📃</div>
+        <div>请上传一份 Word 文档 (.docx)</div>
+        <div style="font-size:11px;opacity:.5;">ONLYOFFICE 转 PDF · PDF.js 渲染 · 同步翻页</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// PDF.js worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+
+// ==================== STATE ====================
+const state = {
+  pdf: null,
+  pages: [], totalPages: 0, currentPage: 0,
+  isScanning: false, isPaused: false,
+  speedMs: 2500,
+  scanTimer: null, animationFrame: null,
+  renderScale: 1.3,
+};
+
+const $ = s => document.querySelector(s);
+const fileInput = $('#fileInput');
+const fileNameEl = $('#fileName');
+const btnPlay = $('#btnPlay'), btnPause = $('#btnPause'), btnReset = $('#btnReset');
+const btnExport = $('#btnExport');
+const speedSlider = $('#speedSlider'), speedDisplay = $('#speedDisplay');
+const pdfCanvas = $('#pdfCanvas');
+const pageWrap = $('#pageWrap');
+const scanLine = $('#scanLine'), scanGlow = $('#scanGlow');
+const scanOverlay = document.querySelector('.scan-overlay');
+const particles = $('#particles');
+const pageIndicator = $('#pageIndicator'), progressBar = $('#progressBar');
+const contentBody = $('#contentBody'), contentPageTag = $('#contentPageTag');
+const sheetPageNum = $('#sheetPageNum');
+const stack1 = $('#stack1'), stack2 = $('#stack2');
+const scannerStage = $('#scannerStage');
+
+// ==================== FILE UPLOAD ====================
+fileInput.addEventListener('change', async e => {
+  const file = e.target.files[0]; if (!file) return;
+  fileNameEl.textContent = file.name;
+  resetState();
+  await parseDocx(file);
+});
+scannerStage.addEventListener('dragover', e => e.preventDefault());
+scannerStage.addEventListener('drop', async e => {
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (!file || !file.name.endsWith('.docx')) return;
+  fileNameEl.textContent = file.name;
+  resetState();
+  await parseDocx(file);
+});
+
+// ==================== PARSE + CONVERT ====================
+async function parseDocx(file) {
+  contentBody.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-secondary);">⏳ 正在转换为 PDF（ONLYOFFICE）…</div>';
+  pageIndicator.textContent = '转换中…';
+  try {
+    const form = new FormData(); form.append('file', file);
+    const resp = await fetch('/api/convert', { method: 'POST', body: form });
+    if (!resp.ok) throw new Error((await resp.json().catch(()=>({}))).error || 'server error');
+    const data = await resp.json();
+    state.pages = data.pages;
+    state.totalPages = data.totalPages;
+
+    if (!data.pdfUrl) throw new Error('未返回 PDF');
+    pageIndicator.textContent = `加载 PDF (${state.totalPages} 页)…`;
+    // Load PDF.js
+    const pdf = await pdfjsLib.getDocument(data.pdfUrl).promise;
+    state.pdf = pdf;
+    state.currentPage = 0;
+
+    pageIndicator.textContent = `共 ${state.totalPages} 页 | 准备就绪`;
+    progressBar.style.width = '0%';
+    contentBody.innerHTML = `<div style="text-align:center;padding:60px 20px;color:var(--text-secondary);">
+      ✅ 文档就绪 · 共 <b style="color:var(--accent);font-size:1.3em;">${state.totalPages}</b> 页<br>
+      <span style="font-size:12px;">点击 <b style="color:var(--accent);">▶ 开始</b> 启动扫描预览</span></div>`;
+    contentPageTag.style.display = 'none';
+    btnPlay.disabled = false; btnReset.disabled = false; btnExport.disabled = false;
+
+    await renderPdfPage(0);
+  } catch (err) {
+    console.error(err);
+    contentBody.innerHTML = `<div class="empty-state"><div class="empty-icon">❌</div><div>处理失败: ${err.message}</div></div>`;
+    pageIndicator.textContent = '失败';
+  }
+}
+
+// ==================== RENDER PDF PAGE ====================
+async function renderPdfPage(pageIndex) {
+  if (!state.pdf || pageIndex >= state.totalPages) return;
+  const page = await state.pdf.getPage(pageIndex + 1); // 1-indexed
+  const viewport = page.getViewport({ scale: state.renderScale });
+  // Fit to stage
+  const stageRect = scannerStage.getBoundingClientRect();
+  const maxW = stageRect.width - 60, maxH = stageRect.height - 60;
+  const fit = Math.min(maxW / viewport.width, maxH / viewport.height, 1);
+  const vp = page.getViewport({ scale: state.renderScale * fit });
+  const ctx = pdfCanvas.getContext('2d');
+  pdfCanvas.width = vp.width; pdfCanvas.height = vp.height;
+  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  sheetPageNum.textContent = `第 ${pageIndex + 1} 页`;
+  // sync stack sizes
+  [stack1, stack2].forEach((s, i) => {
+    s.style.width = pdfCanvas.clientWidth + 'px';
+    s.style.height = pdfCanvas.clientHeight + 'px';
+    s.style.transform = `translate(${-(i+1)*7}px, ${(i+1)*7}px)`;
+    s.style.opacity = i === 0 ? '1' : '.4';
+    s.style.zIndex = -(i+1);
+  });
+}
+
+// ==================== SCAN ANIMATION ====================
+function animateScan(durationMs) {
+  return new Promise(resolve => {
+    const h = scanOverlay.clientHeight;
+    const start = performance.now();
+    let lastP = 0;
+    function frame(now) {
+      if (!state.isScanning || state.isPaused) {
+        if (state.isPaused) { state.animationFrame = requestAnimationFrame(frame); return; }
+        resolve(); return;
+      }
+      const t = Math.min((now - start) / durationMs, 1);
+      const e = easeInOutCubic(t);
+      const y = e * h;
+      scanLine.style.top = y + 'px';
+      scanGlow.style.top = (y - 32) + 'px';
+      scanGlow.style.opacity = (t > .03 && t < .97) ? '1' : '0';
+      if (now - lastP > 35 && t < .95) { spawnParticle(y); lastP = now; }
+      if (t < 1) state.animationFrame = requestAnimationFrame(frame);
+      else { scanLine.classList.remove('active'); scanGlow.style.opacity = '0'; resolve(); }
+    }
+    state.animationFrame = requestAnimationFrame(frame);
+  });
+}
+function easeInOutCubic(t) { return t < .5 ? 4*t*t*t : 1 - Math.pow(-2*t+2,3)/2; }
+function spawnParticle(y) {
+  const p = document.createElement('div');
+  p.className = 'particle';
+  const sw = scanOverlay.clientWidth;
+  p.style.left = (24 + Math.random()*(sw-48)) + 'px';
+  p.style.top = y + 'px';
+  p.style.setProperty('--dx', ((Math.random()-.5)*22) + 'px');
+  p.style.setProperty('--dy', (Math.random()*-10-4) + 'px');
+  particles.appendChild(p);
+  p.addEventListener('animationend', () => p.remove());
+}
+function flipPage() {
+  return new Promise(res => {
+    pageWrap.classList.add('flipping');
+    pageWrap.addEventListener('animationend', function h(){
+      pageWrap.removeEventListener('animationend', h);
+      pageWrap.classList.remove('flipping'); res();
+    }, { once: true });
+  });
+}
+// In fast mode, skip the full 0.5s flip animation — just a quick fade
+async function maybeFlip() {
+  if (state.speedMs < 800) {
+    pageWrap.style.transition = 'opacity .08s';
+    pageWrap.style.opacity = '0.35';
+    await sleep(40);
+    pageWrap.style.opacity = '1';
+    await sleep(40);
+  } else {
+    await flipPage();
+  }
+}
+
+// ==================== RIGHT PANEL (Markdown) ====================
+// Configure marked: GFM tables, line breaks
+if (window.marked) {
+  marked.setOptions({ gfm: true, breaks: true, headerIds: false, mangle: false });
+}
+
+function renderMd(md) {
+  if (!md) return '<p style="opacity:.5;">（空白页）</p>';
+  try {
+    return marked.parse(md);
+  } catch(e) {
+    return '<pre>' + (md + '').replace(/</g, '&lt;') + '</pre>';
+  }
+}
+
+function displayCurrentPage(i) {
+  if (i >= state.totalPages) return;
+  contentBody.innerHTML = renderMd(state.pages[i]);
+  contentBody.scrollTop = 0;
+  contentPageTag.style.display = 'inline-block';
+  contentPageTag.textContent = `第 ${i+1} / ${state.totalPages} 页`;
+}
+
+// ==================== SCAN LOOP ====================
+async function runScanLoop() {
+  state.isScanning = true;
+  btnPlay.disabled = true; btnPause.disabled = false;
+  for (let i = state.currentPage; i < state.totalPages; i++) {
+    if (!state.isScanning) break;
+    state.currentPage = i;
+    pageIndicator.textContent = `正在扫描 第 ${i+1} / ${state.totalPages} 页…`;
+    progressBar.style.width = (i / state.totalPages * 100) + '%';
+    // render PDF page + show text simultaneously
+    await renderPdfPage(i);
+    displayCurrentPage(i);
+    scanLine.classList.add('active');
+    // Derive scan duration from total page time (reserve time for flip + gap)
+    const fast = state.speedMs < 800;
+    const flipDur = fast ? 100 : 300;
+    const gap = fast ? 30 : 200;
+    const scanDur = Math.max(150, state.speedMs - flipDur - gap);
+    await animateScan(scanDur);
+    if (!state.isScanning) break;
+    if (i < state.totalPages - 1) await maybeFlip();
+    await sleep(gap);
+  }
+  if (state.isScanning) {
+    pageIndicator.textContent = `✅ 扫描完成 — ${state.totalPages} 页`;
+    progressBar.style.width = '100%';
+    contentPageTag.textContent = `全部 ${state.totalPages} 页`;
+    scanLine.classList.remove('active'); scanGlow.style.opacity = '0';
+  }
+  state.isScanning = false;
+  btnPlay.disabled = false; btnPause.disabled = true;
+}
+function sleep(ms) { return new Promise(r => { state.scanTimer = setTimeout(r, ms); }); }
+
+// ==================== EXPORT MARKDOWN ====================
+function exportMarkdown() {
+  if (!state.pages || !state.pages.length) return;
+  const pageParts = state.pages.map((md, i) => {
+    return `<!-- ===== 第 ${i + 1} 页 / 共 ${state.totalPages} 页 ===== -->\n\n# 📄 第 ${i + 1} 页\n\n${md}`;
+  });
+  const docTitle = (state.fileName || 'document').replace(/\.docx$/i, '');
+  const header = `# ${docTitle}\n\n> 共 ${state.totalPages} 页 · DocScan 导出 · 每页用「第 N 页」标记，可对照 PDF 逐页检查\n`;
+  const full = header + '\n\n---\n\n' + pageParts.join('\n\n---\n\n') + '\n';
+
+  const blob = new Blob([full], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = docTitle + '.md';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  pageIndicator.textContent = `📥 已导出 ${state.totalPages} 页 Markdown`;
+}
+
+btnExport.addEventListener('click', exportMarkdown);
+
+// ==================== CONTROLS ====================
+btnPlay.addEventListener('click', async () => {
+  if (state.totalPages === 0) return;
+  if (state.isPaused) {
+    state.isPaused = false; state.isScanning = true;
+    btnPause.disabled = false; btnPlay.disabled = true;
+    pageIndicator.textContent = `正在扫描 第 ${state.currentPage+1} / ${state.totalPages} 页…`;
+    scanLine.classList.add('active'); runScanLoop(); return;
+  }
+  if (state.isScanning) return;
+  if (state.currentPage >= state.totalPages - 1) {
+    state.currentPage = 0; contentBody.innerHTML = '';
+    progressBar.style.width = '0%'; contentPageTag.style.display = 'none';
+    await renderPdfPage(0);
+  }
+  runScanLoop();
+});
+btnPause.addEventListener('click', () => {
+  if (!state.isScanning) return;
+  state.isPaused = true; state.isScanning = false;
+  btnPause.disabled = true; btnPlay.disabled = false;
+  pageIndicator.textContent = `⏸ 已暂停 — 第 ${state.currentPage+1} / ${state.totalPages} 页`;
+  if (state.animationFrame) cancelAnimationFrame(state.animationFrame);
+  if (state.scanTimer) clearTimeout(state.scanTimer);
+});
+btnReset.addEventListener('click', async () => {
+  stopAll();
+  state.currentPage = 0; state.isScanning = false; state.isPaused = false;
+  progressBar.style.width = '0%';
+  contentBody.innerHTML = `<div style="text-align:center;padding:60px 20px;color:var(--text-secondary);">✅ 就绪<br>点击 <b style="color:var(--accent);">▶ 开始</b> 启动扫描</div>`;
+  contentPageTag.style.display = 'none';
+  pageIndicator.textContent = `共 ${state.totalPages} 页 | 准备就绪`;
+  scanLine.classList.remove('active'); scanGlow.style.opacity = '0'; particles.innerHTML = '';
+  btnPlay.disabled = false; btnPause.disabled = true;
+  await renderPdfPage(0);
+});
+function stopAll() {
+  state.isScanning = false; state.isPaused = false;
+  if (state.animationFrame) cancelAnimationFrame(state.animationFrame);
+  if (state.scanTimer) clearTimeout(state.scanTimer);
+}
+
+// ==================== SPEED (per-page total duration) ====================
+// speedMs = total time per page (scan + flip + gap are derived from it)
+const SPEED_TABLE = { 1: 3000, 2: 2000, 3: 1500, 4: 1000, 5: 500 };
+function updateSpeed() {
+  const v = parseInt(speedSlider.value, 10);
+  state.speedMs = SPEED_TABLE[v] || 1500;
+  speedDisplay.textContent = (state.speedMs/1000).toFixed(2) + 's';
+}
+speedSlider.addEventListener('input', updateSpeed); updateSpeed();
+
+function resetState() {
+  stopAll();
+  state.pdf = null; state.pages = []; state.totalPages = 0; state.currentPage = 0;
+  btnPlay.disabled = true; btnPause.disabled = true; btnReset.disabled = true; btnExport.disabled = true;
+  progressBar.style.width = '0%';
+  scanLine.classList.remove('active'); scanGlow.style.opacity = '0'; particles.innerHTML = '';
+  pageIndicator.textContent = '等待加载文档…';
+  contentPageTag.style.display = 'none';
+}
+
+// ==================== KEYBOARD ====================
+document.addEventListener('keydown', async e => {
+  if (e.target.tagName === 'INPUT') return;
+  switch (e.key) {
+    case ' ': e.preventDefault(); (state.isScanning && !state.isPaused) ? btnPause.click() : btnPlay.click(); break;
+    case 'r': case 'R': if (!e.ctrlKey && !e.metaKey) btnReset.click(); break;
+    case 'ArrowLeft': e.preventDefault(); speedSlider.value = Math.max(1, parseInt(speedSlider.value)-1); updateSpeed(); break;
+    case 'ArrowRight': e.preventDefault(); speedSlider.value = Math.min(5, parseInt(speedSlider.value)+1); updateSpeed(); break;
+    case 'ArrowUp': case 'PageUp': e.preventDefault(); await manualPage(-1); break;
+    case 'ArrowDown': case 'PageDown': e.preventDefault(); await manualPage(1); break;
+  }
+});
+
+// Manual page navigation (used by Arrow/PageUp/PageDown keys)
+async function manualPage(delta) {
+  if (state.isScanning || !state.pdf) return;
+  const next = state.currentPage + delta;
+  if (next < 0 || next >= state.totalPages) return;
+  state.currentPage = next;
+  await renderPdfPage(state.currentPage);
+  displayCurrentPage(state.currentPage);
+  pageIndicator.textContent = `📖 第 ${state.currentPage + 1} / ${state.totalPages} 页`;
+}
+
+// Re-render on resize
+window.addEventListener('resize', () => {
+  if (state.pdf && !state.isScanning) renderPdfPage(state.currentPage);
+});
+
+console.log('📄 DocScan + PDF.js ready');
+</script>
+</body>
+</html>

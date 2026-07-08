@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Runtime data (auto-created directories)
+docs/
+pdfs/
+mds/
+
+# Logs & PIDs
+*.log
+.docscan*.pid
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp test files
+temp_*.docx
