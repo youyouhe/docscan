@@ -1,0 +1,23 @@
+# ONLYOFFICE Document Server — required for docx-to-PDF conversion
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Port 8079 is mapped to host so DocScan can call ConvertService API
+
+services:
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    container_name: onlyoffice
+    ports:
+      - "8079:80"
+    restart: unless-stopped
+    environment:
+      - JWT_ENABLED=false
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_log:/var/log/onlyoffice
+      # Optional: mount Windows fonts for Chinese document support
+      # - /mnt/c/Windows/Fonts:/usr/share/fonts/windows:ro
+
+volumes:
+  onlyoffice_data:
+  onlyoffice_log:

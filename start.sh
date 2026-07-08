@@ -23,8 +23,13 @@ fi
 # ---------- 1. 确保 ONLYOFFICE 容器就绪 ----------
 echo "📦 检查 ONLYOFFICE 容器…"
 if ! docker ps --format '{{.Names}}' | grep -q '^onlyoffice$'; then
-    echo "   容器未运行，正在启动…"
-    docker start onlyoffice
+    if docker ps -a --format '{{.Names}}' | grep -q '^onlyoffice$'; then
+        echo "   容器已存在但未运行，启动中…"
+        docker start onlyoffice
+    else
+        echo "   首次使用，拉取并启动 ONLYOFFICE (约 3GB，需要几分钟)…"
+        docker compose up -d
+    fi
     sleep 10
 fi
 
