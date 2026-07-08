@@ -5,11 +5,16 @@
 ## 快速开始
 
 ```bash
-./start.sh          # 启动服务 (默认 8800 端口)
+./start.sh          # 首次自动拉取 ONLYOFFICE (~3GB) + 启动服务
 ./start.sh 8080     # 指定端口
 ./stop.sh           # 停止
 ./restart.sh        # 重启
 ```
+
+首次运行会自动：
+1. `docker compose up -d` 拉取并启动 ONLYOFFICE 容器
+2. 禁用 JWT、安装中文字体
+3. 启动 DocScan API
 
 启动后访问：
 - **API 文档**: http://localhost:8800/api/docs (Swagger UI)
@@ -17,9 +22,8 @@
 
 ## 依赖
 
-- **Docker** — 运行 ONLYOFFICE Document Server (容器名 `onlyoffice`)
-- **Python 3.10+** — `fastapi uvicorn python-multipart pymupdf python-docx`
-- **ONLYOFFICE 容器** — 需预先拉取 (`docker pull onlyoffice/documentserver`)
+- **Docker** + **docker compose**
+- **Python 3.10+** — `pip install fastapi uvicorn python-multipart pymupdf python-docx`
 
 ## API
 
