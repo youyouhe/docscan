@@ -23,7 +23,7 @@
 ## 依赖
 
 - **Docker** + **docker compose**
-- **Python 3.10+** — `pip install fastapi uvicorn python-multipart pymupdf python-docx`
+- **Python 3.10+** — `pip install -r requirements.txt`
 
 ## API
 
