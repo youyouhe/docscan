@@ -15,8 +15,8 @@ services:
     volumes:
       - onlyoffice_data:/var/www/onlyoffice/Data
       - onlyoffice_log:/var/log/onlyoffice
-      # Optional: mount Windows fonts for Chinese document support
-      # - /mnt/c/Windows/Fonts:/usr/share/fonts/windows:ro
+      # Chinese fonts shipped in this repo (宋体/仿宋/黑体/楷体/雅黑)
+      - ./fonts:/usr/share/fonts/truetype/custom:ro
 
 volumes:
   onlyoffice_data:

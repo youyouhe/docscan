@@ -63,19 +63,19 @@ sleep 3
 
 # ---------- 3. 确保中文字体 ----------
 echo "🔤 检查中文字体…"
-FONT_MISSING=$(docker exec onlyoffice fc-list ":family=宋体" 2>/dev/null | wc -l)
-if [ "$FONT_MISSING" -eq 0 ] && [ -d "/mnt/c/Windows/Fonts" ]; then
-    echo "   安装 Windows 中文字体…"
-    docker exec onlyoffice mkdir -p /var/www/onlyoffice/documentserver/core-fonts/cn
-    for f in simsun.ttc simhei.ttf simkai.ttf simfang.ttf; do
-        [ -f "/mnt/c/Windows/Fonts/$f" ] && docker cp "/mnt/c/Windows/Fonts/$f" "onlyoffice:/var/www/onlyoffice/documentserver/core-fonts/cn/"
-    done
-    docker exec onlyoffice fc-cache -fv >/dev/null 2>&1
-    docker exec onlyoffice supervisorctl restart ds:converter >/dev/null 2>&1
-    sleep 3
-    echo "   字体安装完成 ✅"
-else
+if docker exec onlyoffice fc-list ":family=宋体" 2>/dev/null | grep -q .; then
     echo "   字体就绪 ✅"
+else
+    echo "   注册中文字体（首次或容器重建后，约 1-2 分钟）…"
+    # 字体由 docker-compose 挂载到 /usr/share/fonts/truetype/custom（只读）；
+    # 若未挂载（裸 docker run），则从仓库 fonts/ 拷入容器。
+    if ! docker exec onlyoffice test -s /usr/share/fonts/truetype/custom/simsun.ttc 2>/dev/null; then
+        docker exec onlyoffice mkdir -p /usr/share/fonts/truetype/custom
+        [ -d fonts ] && docker cp fonts/. onlyoffice:/usr/share/fonts/truetype/custom/
+    fi
+    docker exec onlyoffice fc-cache -fv >/dev/null 2>&1
+    docker exec onlyoffice documentserver-generate-allfonts.sh >/dev/null 2>&1
+    echo "   字体注册完成 ✅"
 fi
 
 # ---------- 4. 启动容器内文件服务器 ----------
