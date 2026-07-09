@@ -51,9 +51,13 @@ with open('/etc/onlyoffice/documentserver/local.json') as f:
 cfg['services']['CoAuthoring']['token']['enable']['request']['inbox'] = False
 cfg['services']['CoAuthoring']['token']['enable']['request']['outbox'] = False
 cfg['services']['CoAuthoring']['token']['enable']['browser'] = False
+# 新版 ONLYOFFICE 默认禁止从私有/回环 IP 下载文档(防 SSRF)；DocScan 用 localhost:9999 取源文件会被拦、转换报 -4
+_rfa = cfg['services']['CoAuthoring'].setdefault('request-filtering-agent', {})
+_rfa['allowPrivateIPAddress'] = True
+_rfa['allowMetaIPAddress'] = True
 with open('/etc/onlyoffice/documentserver/local.json', 'w') as f:
     json.dump(cfg, f, indent=2)
-" 2>/dev/null && echo "   JWT 已禁用 ✅"
+" 2>/dev/null && echo "   JWT 已禁用 + 私有 IP 已放行 ✅"
 docker exec onlyoffice supervisorctl restart ds:docservice ds:converter >/dev/null 2>&1
 sleep 3
 
