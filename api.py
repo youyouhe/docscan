@@ -16,20 +16,31 @@ Endpoints:
     GET  /api/conversions          list recent conversions
     GET  /api/health               health check
 
+    POST /api/md2docx                    upload .md → returns {id, fileName, docxUrl}
+    GET  /api/docx/{id}                  download the current docx
+    GET  /api/docx/{id}/placeholders      list 【...】 placeholders with stable ids
+    POST /api/docx/{id}/replace           replace placeholders by id
+    GET  /api/docx/{id}/tables            list table structure (for crossref target picking)
+    GET  /api/docx/{id}/preview           full-text preview (body paragraphs + tables)
+    POST /api/docx/{id}/crossref          bookmark a body keyword + insert a page-number
+                                           cross-reference field into a target table cell
+
 The frontend ONLYOFFICE viewer is proxied through this server (same-origin
 at /oo/…) so the demo at / also works.
 """
 
-import json, os, re, shutil, time, uuid, sys
+import asyncio, json, os, re, shutil, subprocess, time, uuid, sys
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 import httpx
 import uvicorn
+from docx import Document
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # ——— reuse the conversion engine from server.py ———
 ROOT = Path(__file__).parent.resolve()
@@ -37,18 +48,26 @@ sys.path.insert(0, str(ROOT))
 from server import (
     _convert_docx_to_pdf,
     _extract_pdf_pages,
-    _ensure_container_file_server,
+    _recalculate_fields_docx,
 )
+import docx_ops
 OO_BACKEND = 'http://localhost:8079'   # ONLYOFFICE Docker container
 
 # ——— data dirs ———
 DOCS_DIR = ROOT / 'docs'
 PDFS_DIR = ROOT / 'pdfs'
 MDS_DIR  = ROOT / 'mds'
-for d in (DOCS_DIR, PDFS_DIR, MDS_DIR):
+DOCX_DIR = ROOT / 'docx_store'   # persistent editable docx (md2docx output, placeholder/crossref edits)
+for d in (DOCS_DIR, PDFS_DIR, MDS_DIR, DOCX_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 conversions = {}   # {id: metadata}   in-memory
+docx_docs = {}      # {id: metadata}   in-memory, tracks editable docx (see DOCX_DIR)
+
+# 转换是同步阻塞调用（subprocess + httpx.Client），丢进线程池跑，
+# 避免卡住 uvicorn 的单个事件循环；并发数上限防止把 ONLYOFFICE 转换 worker 打爆。
+CONVERT_CONCURRENCY = int(os.environ.get('DOCSCAN_CONVERT_CONCURRENCY', '4'))
+_convert_semaphore = asyncio.Semaphore(CONVERT_CONCURRENCY)
 
 # ═══════════════════════════════════════════════════════════════
 #  App
@@ -88,9 +107,11 @@ async def convert(file: UploadFile = File(description='.docx file')):
     dx = DOCS_DIR / f'{base}.docx'
     pf = PDFS_DIR / f'{base}.pdf'
     dx.write_bytes(await file.read())
+    loop = asyncio.get_running_loop()
     try:
-        n = _convert_docx_to_pdf(dx, pf)
-        pages = _extract_pdf_pages(pf)
+        async with _convert_semaphore:
+            n = await loop.run_in_executor(None, _convert_docx_to_pdf, dx, pf)
+            pages = await loop.run_in_executor(None, _extract_pdf_pages, pf)
         meta = _store(file.filename, pf, pages, n or len(pages))
         dx.unlink(missing_ok=True)
         return JSONResponse(meta)
@@ -124,6 +145,118 @@ def md_page(fid: str, page: int):
 def list_conv(): return list(conversions.values())
 
 # ═══════════════════════════════════════════════════════════════
+#  md → docx, and docx placeholder/crossref editing
+# ═══════════════════════════════════════════════════════════════
+
+def _docx_meta(fid, file_name):
+    return dict(id=fid, fileName=file_name, docxUrl=f'/api/docx/{fid}',
+                created=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+
+def _docx_path(fid):
+    p = DOCX_DIR / f'{fid}.docx'
+    if not p.exists():
+        raise HTTPException(404, 'not found')
+    return p
+
+@app.post('/api/md2docx')
+async def md2docx(file: UploadFile = File(description='.md file')):
+    if not file.filename or not file.filename.lower().endswith('.md'):
+        raise HTTPException(400, 'Only .md accepted')
+    fid = uuid.uuid4().hex[:10]
+    md_path = DOCS_DIR / f'{fid}.md'
+    docx_path = DOCX_DIR / f'{fid}.docx'
+    md_path.write_bytes(await file.read())
+    try:
+        r = subprocess.run(['pandoc', str(md_path), '-o', str(docx_path), '--standalone'],
+                            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip())
+    except Exception as e:
+        md_path.unlink(missing_ok=True)
+        raise HTTPException(500, f'md2docx failed: {e}')
+    md_path.unlink(missing_ok=True)
+    doc = Document(str(docx_path))
+    docx_ops.convert_hr_to_page_breaks(doc)
+    docx_ops.autofit_tables(doc)
+    doc.save(str(docx_path))
+    meta = _docx_meta(fid, file.filename)
+    docx_docs[fid] = meta
+    return JSONResponse(meta)
+
+@app.get('/api/docx/{fid}')
+def get_docx(fid: str):
+    p = _docx_path(fid)
+    return FileResponse(str(p), media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                         filename=f'{fid}.docx', headers={'Cache-Control': 'no-store'})
+
+@app.get('/api/docx/{fid}/placeholders')
+def get_placeholders(fid: str):
+    p = _docx_path(fid)
+    doc = Document(str(p))
+    placeholders = [ph.to_dict() for ph in docx_ops.list_placeholders(doc)]
+    return dict(id=fid, count=len(placeholders), placeholders=placeholders)
+
+class ReplaceRequest(BaseModel):
+    replacements: dict[str, str]   # {placeholder_id: new_text}
+
+@app.post('/api/docx/{fid}/replace')
+def replace_placeholders(fid: str, body: ReplaceRequest):
+    p = _docx_path(fid)
+    doc = Document(str(p))
+    count = docx_ops.replace_placeholders(doc, body.replacements)
+    doc.save(str(p))
+    return dict(id=fid, replaced=count)
+
+@app.get('/api/docx/{fid}/tables')
+def get_tables(fid: str):
+    p = _docx_path(fid)
+    doc = Document(str(p))
+    return dict(id=fid, tables=docx_ops.list_tables(doc))
+
+@app.get('/api/docx/{fid}/preview')
+def get_preview(fid: str):
+    """Lightweight full-text preview of the current docx — body paragraphs
+    (the only pool eligible as a crossref keyword source) plus all tables.
+    Pure local read, no ONLYOFFICE round-trip, so it's fast enough to call
+    after every edit to show the effect immediately.
+    """
+    p = _docx_path(fid)
+    doc = Document(str(p))
+    return dict(id=fid,
+                paragraphs=docx_ops.list_body_paragraphs(doc),
+                tables=docx_ops.list_tables(doc))
+
+class CrossrefRequest(BaseModel):
+    keyword: str                    # exact text to locate in the document body
+    cellPath: str                   # e.g. "table[13].row[1].cell[2]" — from GET .../tables
+    paragraphPath: str | None = None  # e.g. "paragraph[5]", from GET .../preview — required
+                                       # when `keyword` occurs in more than one body paragraph
+
+@app.post('/api/docx/{fid}/crossref')
+async def add_crossref(fid: str, body: CrossrefRequest):
+    p = _docx_path(fid)
+    doc = Document(str(p))
+    try:
+        bookmark = docx_ops.add_page_crossref(doc, body.keyword, body.cellPath, body.paragraphPath)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    doc.save(str(p))
+
+    # Bake the real page number into the field via ONLYOFFICE, then swap
+    # the recalculated file back in as the canonical stored docx.
+    loop = asyncio.get_running_loop()
+    recalced = DOCX_DIR / f'{fid}-recalc.docx'
+    try:
+        async with _convert_semaphore:
+            await loop.run_in_executor(None, _recalculate_fields_docx, p, recalced)
+        shutil.move(str(recalced), str(p))
+    except Exception as e:
+        recalced.unlink(missing_ok=True)
+        raise HTTPException(500, f'page recalculation failed: {e}')
+
+    return dict(id=fid, bookmark=bookmark, cellPath=body.cellPath)
+
+# ═══════════════════════════════════════════════════════════════
 #  Frontend demo  ( / → index.html )
 # ═══════════════════════════════════════════════════════════════
 
@@ -131,6 +264,11 @@ def list_conv(): return list(conversions.values())
 @app.get('/index.html')
 def frontend():
     html = (ROOT / 'index.html').read_text('utf-8')
+    return HTMLResponse(html, headers={'Cache-Control':'no-cache'})
+
+@app.get('/edit.html')
+def edit_frontend():
+    html = (ROOT / 'edit.html').read_text('utf-8')
     return HTMLResponse(html, headers={'Cache-Control':'no-cache'})
 
 # ═══════════════════════════════════════════════════════════════
