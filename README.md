@@ -79,7 +79,7 @@ curl -X POST http://localhost:8800/api/convert \
 
 ```
 docx 上传
-  → ONLYOFFICE ConvertService (Docker) 转 PDF
+  → ONLYOFFICE ConvertService (Docker，经网桥网关直接回源取文件) 转 PDF
   → PyMuPDF 提取每页 Markdown (文本块+表格混合)
   → 返回 PDF URL + 逐页 MD
 ```

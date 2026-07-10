@@ -51,7 +51,7 @@ with open('/etc/onlyoffice/documentserver/local.json') as f:
 cfg['services']['CoAuthoring']['token']['enable']['request']['inbox'] = False
 cfg['services']['CoAuthoring']['token']['enable']['request']['outbox'] = False
 cfg['services']['CoAuthoring']['token']['enable']['browser'] = False
-# 新版 ONLYOFFICE 默认禁止从私有/回环 IP 下载文档(防 SSRF)；DocScan 用 localhost:9999 取源文件会被拦、转换报 -4
+# 新版 ONLYOFFICE 默认禁止从私有/回环 IP 下载文档(防 SSRF)；DocScan 让容器直接回源到宿主机网关 IP 取文件，会被拦、转换报 -4
 _rfa = cfg['services']['CoAuthoring'].setdefault('request-filtering-agent', {})
 _rfa['allowPrivateIPAddress'] = True
 _rfa['allowMetaIPAddress'] = True
@@ -78,23 +78,13 @@ else
     echo "   字体注册完成 ✅"
 fi
 
-# ---------- 4. 启动容器内文件服务器 ----------
-echo "📁 启动文件服务器…"
-docker exec -d onlyoffice sh -c 'cd /tmp && nohup python3 -m http.server 9999 >/tmp/fs.log 2>&1 &' 2>/dev/null
-sleep 1
-if docker exec onlyoffice curl -s --connect-timeout 3 -o /dev/null http://127.0.0.1:9999/ 2>/dev/null; then
-    echo "   文件服务器就绪 ✅ (端口 9999)"
-else
-    echo "   ⚠️  文件服务器可能启动失败，继续…"
-fi
-
-# ---------- 5. 启动 FastAPI ----------
+# ---------- 4. 启动 FastAPI ----------
 echo "🚀 启动 DocScan API (端口 $PORT)…"
 nohup python3 api.py --port "$PORT" > "$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
 
-# ---------- 6. 验证（检查 JSON 内容，防止误判 MinIO 等） ----------
+# ---------- 5. 验证（检查 JSON 内容，防止误判 MinIO 等） ----------
 for i in $(seq 1 20); do
     RESP=$(curl -s "http://localhost:$PORT/api/health" 2>/dev/null || true)
     if echo "$RESP" | grep -q '"status".*"ok"'; then

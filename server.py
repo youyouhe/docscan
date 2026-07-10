@@ -5,27 +5,36 @@ DocScan conversion engine  —  the layer under api.py.
 api.py is only an HTTP shell; the real work lives here. Three functions are
 imported by api.py:
 
-    _ensure_container_file_server()   make sure ONLYOFFICE can fetch our files
+    _ensure_container_file_server()   no-op kept for backwards compatibility
     _convert_docx_to_pdf(docx, pdf)   docx -> PDF via ONLYOFFICE; returns page count
     _extract_pdf_pages(pdf)           per-page text via PyMuPDF; returns list[str]
 
-Conversion path (the ONLYOFFICE container mounts no host dir, so we ferry files
-through it):
+Conversion path (ONLYOFFICE reaches the host over the Docker bridge network,
+so we serve the docx straight off the host — no docker cp / container-side
+file server needed):
 
-    host docx
-      -- docker cp -->  container:/tmp/<base>.docx
-      <-- served by -->  in-container `python3 -m http.server 9999` (loopback)
-      <-- ONLYOFFICE --> POST /converter  (url = http://localhost:9999/<base>.docx)
+    host docx bytes
+      -- served by -->  one-shot ThreadingHTTPServer bound to the docker
+                         bridge gateway IP, random port, single-file only
+      <-- ONLYOFFICE --> POST /converter  (url = http://<gateway>:<port>/<base>.docx)
       --> ONLYOFFICE writes the PDF to its cache and replies with a host-facing
           fileUrl on port 8079 (http://localhost:8079/cache/files/...)
     host pdf  <-- GET that fileUrl
+
+Each conversion gets its own ephemeral server/port, so concurrent conversions
+never share state. The gateway IP is auto-detected from the running container
+(cached after first lookup) rather than hardcoded, since it depends on which
+Docker network the container ends up on.
 
 All endpoints/behaviours below were pinned by live probing against the running
 onlyoffice/documentserver:latest container (JWT disabled).
 """
 
+import http.server
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -37,9 +46,12 @@ except ImportError:  # very new pymupdf may drop the fitz alias
 
 OO_BACKEND = 'http://localhost:8079'   # ONLYOFFICE container, host-facing port
 CONTAINER = 'onlyoffice'                # docker container name
-FS_PORT = 9999                          # in-container file server (loopback only)
 CONVERT_PATH = '/converter'             # ONLYOFFICE 8.x ConvertService endpoint
+DOCBUILDER_PATH = '/docbuilder'         # ONLYOFFICE DocBuilder endpoint — body is the
+                                        # raw .docbuilder script text, NOT JSON-wrapped
 CONVERT_TIMEOUT = 180.0                 # seconds, large docs can take a while
+
+_gateway_ip_cache = None
 
 
 def _run(cmd):
@@ -47,39 +59,76 @@ def _run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-# ════════════════════════════════════════════════════════════════════
-#  In-container file server
-# ════════════════════════════════════════════════════════════════════
 def _ensure_container_file_server():
-    """Ensure ONLYOFFICE can fetch files we push into the container.
+    """Kept as a no-op so older callers/imports don't break; nothing to start."""
+    return True
 
-    Idempotent: if :9999 already answers inside the container, return immediately.
-    Otherwise launch `python3 -m http.server 9999` detached in /tmp and wait for
-    it to come up. start.sh starts this too; we re-assert so api.py works even
-    when launched standalone.
+
+# ════════════════════════════════════════════════════════════════════
+#  Docker bridge gateway IP  (host address reachable *from* the container)
+# ════════════════════════════════════════════════════════════════════
+def _container_gateway_ip():
+    """Host IP the ONLYOFFICE container can reach us on, cached after first lookup.
+
+    Detected from the container's own network config rather than hardcoded,
+    since it depends on which Docker network / compose project started it.
     """
-    url = f'http://localhost:{FS_PORT}/'
-    if _container_http_ok(url):
-        return True
+    global _gateway_ip_cache
+    if _gateway_ip_cache:
+        return _gateway_ip_cache
 
-    _run(['docker', 'exec', '-d', CONTAINER, 'sh', '-c',
-          f'cd /tmp && nohup python3 -m http.server {FS_PORT} >/tmp/fs.log 2>&1 &'])
+    r = _run(['docker', 'inspect', CONTAINER, '--format',
+              '{{range $k, $v := .NetworkSettings.Networks}}{{$v.Gateway}}{{"\\n"}}{{end}}'])
+    if r.returncode != 0:
+        raise RuntimeError(f'docker inspect {CONTAINER} failed: {r.stderr.strip()}')
+    ips = [ln.strip() for ln in (r.stdout or '').splitlines() if ln.strip()]
+    if not ips:
+        raise RuntimeError(f'could not determine gateway IP for container {CONTAINER}')
 
-    for _ in range(50):  # wait up to ~5s
-        if _container_http_ok(url):
-            return True
-        time.sleep(0.1)
-    raise RuntimeError(f'container file server on :{FS_PORT} did not come up')
+    _gateway_ip_cache = ips[0]
+    return _gateway_ip_cache
 
 
-def _container_http_ok(url):
-    """True if curl inside the container gets a 2xx/3xx for url."""
-    r = subprocess.run(
-        ['docker', 'exec', CONTAINER, 'curl', '-s', '-o', '/dev/null',
-         '-w', '%{http_code}', '--max-time', '3', url],
-        capture_output=True, text=True)
-    code = (r.stdout or '').strip()
-    return bool(code) and code[0] in '23'
+# ════════════════════════════════════════════════════════════════════
+#  One-shot single-file HTTP server (host -> container, per conversion)
+# ════════════════════════════════════════════════════════════════════
+class _SingleFileHandler(http.server.BaseHTTPRequestHandler):
+    def __init__(self, *args, data=b'', file_name='', **kwargs):
+        self._data = data
+        self._file_name = file_name
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        if self.path.lstrip('/') != self._file_name:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(self._data)))
+        self.end_headers()
+        self.wfile.write(self._data)
+
+    def log_message(self, fmt, *args):  # silence per-request stderr noise
+        pass
+
+
+@contextmanager
+def _serve_file_once(file_name, data):
+    """Serve `data` at /<file_name> on a random port bound to the docker
+    gateway IP, for the lifetime of the `with` block. One ephemeral server
+    per call, so concurrent conversions never share a port or file.
+    """
+    from functools import partial
+    handler = partial(_SingleFileHandler, data=data, file_name=file_name)
+    bind_ip = _container_gateway_ip()
+    httpd = http.server.ThreadingHTTPServer((bind_ip, 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield bind_ip, httpd.server_address[1]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -89,29 +138,26 @@ def _convert_docx_to_pdf(docx_path, pdf_path, *, key=None):
     """Convert a host .docx to a host PDF via ONLYOFFICE.
 
     Returns the PDF page count (int; 0 if it can't be read). Raises on any
-    conversion or download failure. Cleans up the pushed source regardless.
+    conversion or download failure.
     """
     docx_path, pdf_path = Path(docx_path), Path(pdf_path)
     base = docx_path.stem
     key = key or f'{base}-{int(time.time())}'   # unique key => never a stale cache hit
+    file_name = f'{base}.docx'
+    data = docx_path.read_bytes()
 
-    _ensure_container_file_server()
-    _cp_into_container(docx_path, f'/tmp/{base}.docx')
-    src_url = f'http://localhost:{FS_PORT}/{base}.docx'
-
-    payload = {
-        'async': False,
-        'filetype': 'docx',
-        'key': key,
-        'outputtype': 'pdf',
-        'title': f'{base}.docx',
-        'url': src_url,
-    }
-    try:
+    with _serve_file_once(file_name, data) as (bind_ip, port):
+        src_url = f'http://{bind_ip}:{port}/{file_name}'
+        payload = {
+            'async': False,
+            'filetype': 'docx',
+            'key': key,
+            'outputtype': 'pdf',
+            'title': file_name,
+            'url': src_url,
+        }
         file_url = _request_convert(payload)   # host-facing, :8079
         _download(file_url, pdf_path)
-    finally:
-        _run(['docker', 'exec', CONTAINER, 'rm', '-f', f'/tmp/{base}.docx'])
 
     return _pdf_page_count(pdf_path)
 
@@ -140,18 +186,68 @@ def _download(file_url, dest):
                 f.write(chunk)
 
 
-def _cp_into_container(src, container_path):
-    r = _run(['docker', 'cp', str(src), f'{CONTAINER}:{container_path}'])
-    if r.returncode != 0:
-        raise RuntimeError(f'docker cp failed: {r.stderr.strip()}')
-
-
 def _pdf_page_count(pdf_path):
     try:
         with fitz.open(str(pdf_path)) as d:
             return d.page_count
     except Exception:
         return 0
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Recalculate fields (e.g. PAGEREF) via ONLYOFFICE DocBuilder
+# ════════════════════════════════════════════════════════════════════
+def _recalculate_fields_docx(docx_path, out_path):
+    """Force ONLYOFFICE to lay out the document and bake real values into
+    field codes (e.g. PAGEREF page numbers), then save. Needed because
+    fields inserted by python-docx (or by us) carry a cached display value
+    of 0/blank until something actually paginates the document.
+
+    The DocBuilder script here is a fixed template — no user data is ever
+    interpolated into it, only the source/output file names we control —
+    so there's no script-injection surface even though the endpoint takes
+    raw JS text as its POST body.
+    """
+    docx_path, out_path = Path(docx_path), Path(out_path)
+    base = docx_path.stem
+    file_name = f'{base}.docx'
+    out_name = f'{base}-recalc.docx'
+    data = docx_path.read_bytes()
+
+    with _serve_file_once(file_name, data) as (bind_ip, port):
+        src_url = f'http://{bind_ip}:{port}/{file_name}'
+        script = (
+            f'builder.OpenFile("{src_url}", "docx");\n'
+            'var oDocument = Api.GetDocument();\n'
+            'oDocument.ForceRecalculate();\n'
+            'oDocument.UpdateAllFields();\n'
+            'oDocument.ForceRecalculate();\n'
+            f'builder.SaveFile("docx", "{out_name}");\n'
+            'builder.CloseFile();\n'
+        )
+        file_url = _request_docbuilder(script)
+        _download(file_url, out_path)
+
+
+def _request_docbuilder(script):
+    """POST a raw DocBuilder script to ONLYOFFICE; return the first output fileUrl.
+
+    Unlike ConvertService, this endpoint expects the script text itself as
+    the POST body — wrapping it in {"script": ...} JSON makes ONLYOFFICE try
+    to parse the wrapper as JS and fail with a syntax error.
+    """
+    with httpx.Client(timeout=CONVERT_TIMEOUT) as c:
+        r = c.post(OO_BACKEND + DOCBUILDER_PATH,
+                   headers={'Content-Type': 'application/json'},
+                   content=script.encode('utf-8'))
+        r.raise_for_status()
+        data = r.json()
+    if data.get('error'):
+        raise RuntimeError(f'docbuilder error: {data}')
+    urls = data.get('urls') or {}
+    if not urls:
+        raise RuntimeError(f'no output urls from docbuilder: {data}')
+    return next(iter(urls.values()))
 
 
 # ════════════════════════════════════════════════════════════════════
