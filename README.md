@@ -156,9 +156,12 @@ curl -X POST http://localhost:8800/api/docx/e73911e954/crossref \
 ```
 docx 上传
   → ONLYOFFICE ConvertService (Docker，经网桥网关直接回源取文件) 转 PDF
-  → PyMuPDF 提取每页 Markdown (文本块+表格混合)
+  → PyMuPDF 提取每页文本，并用 find_tables() 检测表格区域
+    → 表格区域按行列渲染为 GFM Markdown 表格（| 分隔），非表格文字按原阅读顺序保留为纯文本
   → 返回 PDF URL + 逐页 MD
 ```
+
+**表格识别的边界**：`find_tables()` 基于版式（网格线/对齐）检测表格，对绝大多数规整表格（评分表、报价表、索引表等）能准确还原行列结构；但极少数复杂排版（如单元格内嵌套小表格、无边框纯空格对齐的伪表格）可能识别不到或识别有误。下游读取 Markdown 时如遇到关键数据（金额、分值）所在段落不像表格，应结合原 PDF 或 Word 交叉核对，不要仅凭本服务输出的 Markdown 下结论。
 
 md → docx 编辑流程：
 ```
@@ -174,7 +177,7 @@ md 上传 → pandoc 转 docx
 ```
 docscan/
 ├── api.py          # FastAPI 服务
-├── server.py       # docx→pdf 转换引擎 + 字段重算引擎
+├── server.py       # docx→pdf 转换引擎（ONLYOFFICE）+ PDF→表格感知 Markdown（PyMuPDF find_tables）+ 字段重算引擎
 ├── docx_ops.py     # 占位符提取/替换、书签/页码交叉引用（python-docx 直操 XML）
 ├── index.html      # 前端预览 Demo
 ├── start.sh        # 启动脚本 (自动配置 ONLYOFFICE)

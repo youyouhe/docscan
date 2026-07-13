@@ -251,17 +251,114 @@ def _request_docbuilder(script):
 
 
 # ════════════════════════════════════════════════════════════════════
-#  PDF -> per-page text (Markdown-ish)
+#  PDF -> per-page text (Markdown-ish, table-aware)
 # ════════════════════════════════════════════════════════════════════
 def _extract_pdf_pages(pdf_path):
-    """Extract text per page from a PDF; return list[str] (one string per page,
-    ordered, 1-indexed by position). Pages that are image-only yield ''.
+    """Extract per-page Markdown from a PDF; return list[str] (one string per
+    page, ordered, 1-indexed by position). Pages that are image-only yield ''.
+
+    Tables are detected via PyMuPDF's find_tables() and rendered as GFM
+    pipe-tables so row/column structure survives (scoring tables, quotation
+    tables, etc.). Non-table text is extracted as plain text blocks. Both are
+    interleaved in top-to-bottom reading order using each block's bbox.
     """
     pages = []
     with fitz.open(str(pdf_path)) as doc:
         for page in doc:
-            pages.append(_tidy(page.get_text('text') or ''))
+            pages.append(_tidy(_page_to_markdown(page)))
     return pages
+
+
+def _drop_nested_tables(tables, tol=2.0):
+    """find_tables() sometimes misdetects a complex cell inside a big table as
+    a second, independent table fully contained within the first one's bbox.
+    Drop any table whose bbox is contained within another's to avoid emitting
+    the same region twice.
+    """
+    def _contains(outer, inner):
+        ox0, oy0, ox1, oy1 = outer
+        ix0, iy0, ix1, iy1 = inner
+        return (ix0 >= ox0 - tol and iy0 >= oy0 - tol and
+                ix1 <= ox1 + tol and iy1 <= oy1 + tol)
+
+    keep = []
+    for i, t in enumerate(tables):
+        nested_in_other = any(
+            i != j and _contains(other.bbox, t.bbox) and other.bbox != t.bbox
+            for j, other in enumerate(tables)
+        )
+        if not nested_in_other:
+            keep.append(t)
+    return keep
+
+
+def _page_to_markdown(page):
+    """Render one page as text, with detected tables rendered as Markdown
+    pipe-tables, interleaved with surrounding text by vertical position.
+    """
+    try:
+        tables = page.find_tables().tables
+    except Exception:
+        tables = []
+    tables = _drop_nested_tables(tables)
+
+    if not tables:
+        return page.get_text('text') or ''
+
+    # Text blocks (x0, y0, x1, y1, text, block_no, block_type)
+    text_blocks = [b for b in page.get_text('blocks') if b[6] == 0]
+
+    def _overlaps_table(block, table_bbox, tol=2.0):
+        bx0, by0, bx1, by1 = block[:4]
+        tx0, ty0, tx1, ty1 = table_bbox
+        return not (bx1 < tx0 - tol or bx0 > tx1 + tol or by1 < ty0 - tol or by0 > ty1 + tol)
+
+    items = []  # (y0, kind, payload)
+    for t in tables:
+        items.append((t.bbox[1], 'table', t))
+    for b in text_blocks:
+        if any(_overlaps_table(b, t.bbox) for t in tables):
+            continue  # skip text that's actually inside a table region
+        txt = (b[4] or '').strip()
+        if txt:
+            items.append((b[1], 'text', txt))
+
+    items.sort(key=lambda it: it[0])
+
+    parts = []
+    for _, kind, payload in items:
+        if kind == 'text':
+            parts.append(payload)
+        else:
+            md = _table_to_markdown(payload)
+            if md:
+                parts.append(md)
+    return '\n\n'.join(parts)
+
+
+def _table_to_markdown(table):
+    """Render a fitz Table as a GFM pipe-table. Returns '' if extraction fails
+    or the table has no usable rows.
+    """
+    try:
+        rows = table.extract()
+    except Exception:
+        return ''
+    if not rows:
+        return ''
+
+    def _cell(v):
+        return (v or '').replace('\n', ' ').replace('|', '\\|').strip()
+
+    header = [_cell(c) for c in rows[0]]
+    ncol = len(header) or 1
+    lines = ['| ' + ' | '.join(header) + ' |',
+              '|' + '|'.join(['---'] * ncol) + '|']
+    for row in rows[1:]:
+        cells = [_cell(c) for c in row]
+        cells += [''] * (ncol - len(cells))  # pad short rows
+        lines.append('| ' + ' | '.join(cells[:ncol]) + ' |')
+    return '\n'.join(lines)
 
 
 def _tidy(text):
