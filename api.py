@@ -183,6 +183,24 @@ async def md2docx(file: UploadFile = File(description='.md file')):
     docx_docs[fid] = meta
     return JSONResponse(meta)
 
+@app.post('/api/docx/upload')
+async def upload_docx(file: UploadFile = File(description='.docx file')):
+    """Accept an existing .docx (e.g. from an external generator like
+    generate_docx.js) and register it for editing — placeholder listing /
+    replacement, cross-reference insertion, preview, and download — exactly
+    as if it had been created by /api/md2docx.
+
+    No conversion is performed; the file is stored as-is.
+    """
+    if not file.filename or not file.filename.lower().endswith('.docx'):
+        raise HTTPException(400, 'Only .docx accepted')
+    fid = uuid.uuid4().hex[:10]
+    docx_path = DOCX_DIR / f'{fid}.docx'
+    docx_path.write_bytes(await file.read())
+    meta = _docx_meta(fid, file.filename)
+    docx_docs[fid] = meta
+    return JSONResponse(meta)
+
 @app.get('/api/docx/{fid}')
 def get_docx(fid: str):
     p = _docx_path(fid)

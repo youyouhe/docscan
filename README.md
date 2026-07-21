@@ -93,6 +93,23 @@ curl -X POST http://localhost:8800/api/md2docx \
 }
 ```
 
+### `POST /api/docx/upload`
+上传已有的 `.docx`（如 `generate_docx.js` 输出），注册到 DocScan 供后续编辑——占位符提取/替换、表格列表、交叉引用插入——与 `md2docx` 产出的 docx 一样可编辑。不做任何转换，仅存储。
+
+```bash
+curl -X POST http://localhost:8800/api/docx/upload \
+  -F "file=@output.docx"
+```
+
+响应:
+```json
+{
+  "id": "a1b2c3d4e5",
+  "fileName": "output.docx",
+  "docxUrl": "/api/docx/a1b2c3d4e5"
+}
+```
+
 ### `GET /api/docx/{id}`
 下载当前的 docx（含后续 replace/crossref 的修改）。
 
