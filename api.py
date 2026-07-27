@@ -116,12 +116,29 @@ def _valid_keys():
         _valid_keys_mtime = m
     return _valid_keys_cache
 
+def _record_owner(fid, key):
+    """上传时记录文档归属的 key（持久化到 owners/，重启不丢）。"""
+    if key:
+        (OWNERS_DIR / f'{fid}.owner').write_text(key, 'utf-8')
+
+def _assert_owner(fid, request):
+    """访问校验：仅 owner key 可操作该 fid；无归属记录(旧文件)→ 404。"""
+    key = getattr(request.state, 'api_key', None)
+    if not key:
+        return
+    p = OWNERS_DIR / f'{fid}.owner'
+    if not p.exists():
+        raise HTTPException(404, 'not found')
+    if p.read_text('utf-8').strip() != key:
+        raise HTTPException(403, 'forbidden')
+
 # ——— data dirs ———
 DOCS_DIR = ROOT / 'docs'
 PDFS_DIR = ROOT / 'pdfs'
 MDS_DIR  = ROOT / 'mds'
 DOCX_DIR = ROOT / 'docx_store'   # persistent editable docx (md2docx output, placeholder/crossref edits)
-for d in (DOCS_DIR, PDFS_DIR, MDS_DIR, DOCX_DIR):
+OWNERS_DIR = ROOT / 'owners'     # {fid}.owner → key，文档归属（访问控制 S6）
+for d in (DOCS_DIR, PDFS_DIR, MDS_DIR, DOCX_DIR, OWNERS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 conversions = {}   # {id: metadata}   in-memory
@@ -272,7 +289,7 @@ def _store(docx_name, pdf_path, pages, page_count):
 def health(): return dict(status='ok', service='DocScan API', version='1.0.0')
 
 @app.post('/api/convert')
-async def convert(file: UploadFile = File(description='.docx file')):
+async def convert(request: Request, file: UploadFile = File(description='.docx file')):
     if not file.filename or not file.filename.lower().endswith('.docx'):
         raise HTTPException(400, 'Only .docx accepted')
     base = uuid.uuid4().hex[:12]
@@ -285,6 +302,7 @@ async def convert(file: UploadFile = File(description='.docx file')):
             n = await loop.run_in_executor(None, _convert_docx_to_pdf, dx, pf)
             pages = await loop.run_in_executor(None, _extract_pdf_pages, pf)
         meta = _store(file.filename, pf, pages, n or len(pages))
+        _record_owner(meta['id'], request.state.api_key)
         dx.unlink(missing_ok=True)
         return JSONResponse(meta)
     except Exception as e:
@@ -293,13 +311,15 @@ async def convert(file: UploadFile = File(description='.docx file')):
         raise HTTPException(500, 'conversion failed (see server logs)')
 
 @app.get('/api/pdf/{fid}')
-def pdf(fid: str):
+def pdf(fid: str, request: Request):
+    _assert_owner(fid, request)
     p = _safe_path(PDFS_DIR, fid, 'pdf')
     if not p.exists(): raise HTTPException(404, 'not found')
     return FileResponse(str(p), media_type='application/pdf', filename=f'{fid}.pdf')
 
 @app.get('/api/md/{fid}')
-def md_all(fid: str):
+def md_all(fid: str, request: Request):
+    _assert_owner(fid, request)
     j = _safe_path(MDS_DIR, fid, 'json')
     if not j.exists(): raise HTTPException(404, 'not found')
     pages = json.loads(j.read_text('utf-8'))
@@ -307,7 +327,8 @@ def md_all(fid: str):
                 fileName=conversions.get(fid, {}).get('fileName',''))
 
 @app.get('/api/md/{fid}/{page}')
-def md_page(fid: str, page: int):
+def md_page(fid: str, page: int, request: Request):
+    _assert_owner(fid, request)
     j = _safe_path(MDS_DIR, fid, 'json')
     if not j.exists(): raise HTTPException(404, 'not found')
     pages = json.loads(j.read_text('utf-8'))
@@ -345,7 +366,7 @@ def _md_to_docx_sync(md_path, docx_path):
 
 
 @app.post('/api/md2docx')
-async def md2docx(file: UploadFile = File(description='.md file')):
+async def md2docx(request: Request, file: UploadFile = File(description='.md file')):
     if not file.filename or not file.filename.lower().endswith('.md'):
         raise HTTPException(400, 'Only .md accepted')
     fid = uuid.uuid4().hex[:10]
@@ -365,12 +386,13 @@ async def md2docx(file: UploadFile = File(description='.md file')):
         log.exception('md2docx failed')
         raise HTTPException(500, 'md2docx failed (see server logs)')
     md_path.unlink(missing_ok=True)
+    _record_owner(fid, request.state.api_key)
     meta = _docx_meta(fid, file.filename)
     docx_docs[fid] = meta
     return JSONResponse(meta)
 
 @app.post('/api/docx/upload')
-async def upload_docx(file: UploadFile = File(description='.docx file')):
+async def upload_docx(request: Request, file: UploadFile = File(description='.docx file')):
     """Accept an existing .docx (e.g. from an external generator like
     generate_docx.js) and register it for editing — placeholder listing /
     replacement, cross-reference insertion, preview, and download — exactly
@@ -383,18 +405,21 @@ async def upload_docx(file: UploadFile = File(description='.docx file')):
     fid = uuid.uuid4().hex[:10]
     docx_path = DOCX_DIR / f'{fid}.docx'
     docx_path.write_bytes(_validate_docx(await _read_capped(file)))
+    _record_owner(fid, request.state.api_key)
     meta = _docx_meta(fid, file.filename)
     docx_docs[fid] = meta
     return JSONResponse(meta)
 
 @app.get('/api/docx/{fid}')
-def get_docx(fid: str):
+def get_docx(fid: str, request: Request):
+    _assert_owner(fid, request)
     p = _docx_path(fid)
     return FileResponse(str(p), media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                          filename=f'{fid}.docx', headers={'Cache-Control': 'no-store'})
 
 @app.get('/api/docx/{fid}/placeholders')
-def get_placeholders(fid: str):
+def get_placeholders(fid: str, request: Request):
+    _assert_owner(fid, request)
     p = _docx_path(fid)
     doc = Document(str(p))
     placeholders = [ph.to_dict() for ph in docx_ops.list_placeholders(doc)]
@@ -404,7 +429,8 @@ class ReplaceRequest(BaseModel):
     replacements: dict[str, str]   # {placeholder_id: new_text}
 
 @app.post('/api/docx/{fid}/replace')
-def replace_placeholders(fid: str, body: ReplaceRequest):
+def replace_placeholders(fid: str, body: ReplaceRequest, request: Request):
+    _assert_owner(fid, request)
     p = _docx_path(fid)
     doc = Document(str(p))
     count = docx_ops.replace_placeholders(doc, body.replacements)
@@ -412,13 +438,15 @@ def replace_placeholders(fid: str, body: ReplaceRequest):
     return dict(id=fid, replaced=count)
 
 @app.get('/api/docx/{fid}/tables')
-def get_tables(fid: str):
+def get_tables(fid: str, request: Request):
+    _assert_owner(fid, request)
     p = _docx_path(fid)
     doc = Document(str(p))
     return dict(id=fid, tables=docx_ops.list_tables(doc))
 
 @app.get('/api/docx/{fid}/preview')
-def get_preview(fid: str):
+def get_preview(fid: str, request: Request):
+    _assert_owner(fid, request)
     """Lightweight full-text preview of the current docx — body paragraphs
     (the only pool eligible as a crossref keyword source) plus all tables.
     Pure local read, no ONLYOFFICE round-trip, so it's fast enough to call
@@ -437,7 +465,8 @@ class CrossrefRequest(BaseModel):
                                        # when `keyword` occurs in more than one body paragraph
 
 @app.post('/api/docx/{fid}/crossref')
-async def add_crossref(fid: str, body: CrossrefRequest):
+async def add_crossref(fid: str, body: CrossrefRequest, request: Request):
+    _assert_owner(fid, request)
     p = _docx_path(fid)
     doc = Document(str(p))
     try:
