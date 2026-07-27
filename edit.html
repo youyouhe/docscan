@@ -170,6 +170,30 @@
 </div>
 
 <script>
+// ==================== API KEY ====================
+// Backend requires DOCSCAN_API_KEY on every /api/* call. We keep it in
+// localStorage (prompt once if missing) and auto-inject the header into
+// same-origin /api fetches so the rest of the code stays unchanged.
+function apiKey() {
+  let k = localStorage.getItem('docscan_api_key');
+  if (!k) {
+    k = (prompt('请输入 DocScan API Key（见服务启动日志，或 DOCSCAN_API_KEY 环境变量）：') || '').trim();
+    if (k) localStorage.setItem('docscan_api_key', k);
+  }
+  return k || '';
+}
+(function () {
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, opts) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (url.indexOf('/api/') === 0) {
+      opts = opts || {};
+      opts.headers = Object.assign({ 'X-API-Key': apiKey() }, opts.headers || {});
+    }
+    return _origFetch(input, opts);
+  };
+})();
+
 const $ = s => document.querySelector(s);
 let docId = null;
 let placeholders = [];
@@ -439,9 +463,17 @@ $('#btnApplyCrossref').addEventListener('click', async () => {
 });
 
 // ---------- Step 4: download / convert ----------
-$('#btnDownloadDocx').addEventListener('click', () => {
+$('#btnDownloadDocx').addEventListener('click', async () => {
   if (!docId) return;
-  window.open(`/api/docx/${docId}`, '_blank');
+  // fetch carries the API key (auto-injected); window.open can't, so download via blob.
+  const resp = await fetch(`/api/docx/${docId}`);
+  if (!resp.ok) { log(`下载失败: ${(await resp.json().catch(() => ({}))).detail || resp.status}`, 'err'); return; }
+  const blob = await resp.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${docId}.docx`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
 
 $('#btnConvertPdf').addEventListener('click', async () => {

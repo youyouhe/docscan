@@ -27,7 +27,24 @@ if ! docker ps --format '{{.Names}}' | grep -q '^onlyoffice$'; then
         echo "   容器已存在但未运行，启动中…"
         docker start onlyoffice
     else
-        echo "   首次使用，拉取并启动 ONLYOFFICE (约 3GB，需要几分钟)…"
+        echo "   首次使用，拉取 ONLYOFFICE 镜像 (约 3GB，需要几分钟)…"
+        echo "   （网络不稳会自动重试，支持断点续传；持续失败见末尾加速器提示）"
+        for i in $(seq 1 5); do
+            if docker pull onlyoffice/documentserver:latest; then
+                break
+            fi
+            if [ "$i" -eq 5 ]; then
+                echo "   ❌ 镜像拉取连续 5 次失败。"
+                echo "      多半是访问 Docker Hub 网络不稳（connection reset）。可配置镜像加速器后重试："
+                echo "        sudo tee /etc/docker/daemon.json >/dev/null <<'EOF'"
+                echo '        { "registry-mirrors": ["https://<你的加速器地址，如阿里云专属地址>.mirror.aliyuncs.com"] }'
+                echo "        EOF"
+                echo "        sudo systemctl restart docker && ./start.sh"
+                exit 1
+            fi
+            echo "   ⚠️  拉取中断（connection reset），10 秒后重试 ($i/5)…"
+            sleep 10
+        done
         docker compose up -d
     fi
     sleep 10
@@ -78,13 +95,29 @@ else
     echo "   字体注册完成 ✅"
 fi
 
-# ---------- 4. 启动 FastAPI ----------
+# ---------- 4. 确定 API Key ----------
+# 优先环境变量；其次复用已保存的 key（跨重启稳定）；都没有则生成并落盘。
+KEY_FILE="$SCRIPT_DIR/.docscan-api-key"
+if [ -n "$DOCSCAN_API_KEY" ]; then
+    API_KEY="$DOCSCAN_API_KEY"
+    echo "🔐 使用环境变量 DOCSCAN_API_KEY"
+elif [ -s "$KEY_FILE" ]; then
+    API_KEY="$(cat "$KEY_FILE")"
+    echo "🔐 复用已保存的 API Key"
+else
+    API_KEY="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))' 2>/dev/null || head -c 32 /dev/urandom | base64)"
+    printf '%s' "$API_KEY" > "$KEY_FILE"
+    chmod 600 "$KEY_FILE" 2>/dev/null
+    echo "🔐 已生成并保存新的 API Key ($KEY_FILE)"
+fi
+
+# ---------- 5. 启动 FastAPI ----------
 echo "🚀 启动 DocScan API (端口 $PORT)…"
-nohup python3 api.py --port "$PORT" > "$LOG_FILE" 2>&1 &
+DOCSCAN_API_KEY="$API_KEY" nohup python3 api.py --port "$PORT" > "$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
 
-# ---------- 5. 验证（检查 JSON 内容，防止误判 MinIO 等） ----------
+# ---------- 6. 验证（检查 JSON 内容，防止误判 MinIO 等） ----------
 for i in $(seq 1 20); do
     RESP=$(curl -s "http://localhost:$PORT/api/health" 2>/dev/null || true)
     if echo "$RESP" | grep -q '"status".*"ok"'; then
@@ -94,6 +127,7 @@ for i in $(seq 1 20); do
         echo "  📡 http://localhost:$PORT"
         echo "  📖 Swagger: http://localhost:$PORT/api/docs"
         echo "  🖥️  前端 Demo: http://localhost:$PORT"
+        echo "  🔑 API Key: $API_KEY"
         echo "  📋 PID: $PID"
         echo "  📝 日志: $LOG_FILE"
         echo "═══════════════════════════════════════════"

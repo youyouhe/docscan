@@ -12,6 +12,7 @@ docx_store/
 # Logs & PIDs
 *.log
 .docscan*.pid
+.docscan-api-key
 
 # IDE
 .vscode/

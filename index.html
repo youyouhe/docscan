@@ -260,6 +260,30 @@
 </div>
 
 <script>
+// ==================== API KEY ====================
+// Backend requires DOCSCAN_API_KEY on every /api/* call. We keep it in
+// localStorage (prompt once if missing) and auto-inject the header into
+// same-origin /api fetches so the rest of the code stays unchanged.
+function apiKey() {
+  let k = localStorage.getItem('docscan_api_key');
+  if (!k) {
+    k = (prompt('请输入 DocScan API Key（见服务启动日志，或 DOCSCAN_API_KEY 环境变量）：') || '').trim();
+    if (k) localStorage.setItem('docscan_api_key', k);
+  }
+  return k || '';
+}
+(function () {
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, opts) {
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (url.indexOf('/api/') === 0) {
+      opts = opts || {};
+      opts.headers = Object.assign({ 'X-API-Key': apiKey() }, opts.headers || {});
+    }
+    return _origFetch(input, opts);
+  };
+})();
+
 // PDF.js worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
 
@@ -322,7 +346,7 @@ async function parseDocx(file) {
     if (!data.pdfUrl) throw new Error('未返回 PDF');
     pageIndicator.textContent = `加载 PDF (${state.totalPages} 页)…`;
     // Load PDF.js
-    const pdf = await pdfjsLib.getDocument(data.pdfUrl).promise;
+    const pdf = await pdfjsLib.getDocument({ url: data.pdfUrl, httpHeaders: { 'X-API-Key': apiKey() } }).promise;
     state.pdf = pdf;
     state.currentPage = 0;
 

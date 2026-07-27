@@ -4,8 +4,15 @@
 
 ## 快速开始
 
+**首次使用**（一键装齐 docker compose / pandoc / Python 依赖 / docker 组权限，再启动）：
 ```bash
-./start.sh          # 首次自动拉取 ONLYOFFICE (~3GB) + 启动服务
+./setup.sh          # 安装 + 启动（默认 8800），首次会拉取 ONLYOFFICE (~3GB)
+./setup.sh 8080     # 指定端口
+```
+
+**之后日常使用**：
+```bash
+./start.sh          # 启动服务（无需重新安装）
 ./start.sh 8080     # 指定端口
 ./stop.sh           # 停止
 ./restart.sh        # 重启
@@ -22,11 +29,16 @@
 
 ## 依赖
 
-- **Docker** + **docker compose**
-- **Python 3.10+** — `pip install -r requirements.txt`
-- **pandoc** — md→docx 转换（`apt install pandoc` 或对应系统包管理器）
+> 除 **Docker Engine** 外，其余依赖均可由 `./setup.sh` 自动安装（docker compose、pandoc、Python 包、docker 组权限）。
+
+- **Docker Engine** — 需预先安装（[官方指南](https://docs.docker.com/engine/install/)）；`docker compose`、中文字体由本项目脚本处理
+- **Python 3.10+** — `pip install -r requirements.txt`（setup 自动）
+- **pandoc** — md→docx 转换（setup 自动 `apt install pandoc`）
 
 ## API
+
+> **认证**：除 `GET /api/health`、`/api/docs`、`/openapi.json` 外，所有 `/api/*` 接口都需要 API Key——通过请求头 `X-API-Key: <key>` 或 `Authorization: Bearer <key>` 传入。
+> Key 由 `start.sh` 首次启动时自动生成并保存到 `.docscan-api-key`（也可用环境变量 `DOCSCAN_API_KEY` 固定），启动时会打印在终端；前端 Demo 首次访问会弹窗要求输入。下方 curl 示例为简洁省略了该头，实际调用请加上 `-H "X-API-Key: <你的key>"`。
 
 ### `POST /api/convert`
 上传 `.docx`，返回转换结果。
@@ -197,6 +209,7 @@ docscan/
 ├── server.py       # docx→pdf 转换引擎（ONLYOFFICE）+ PDF→表格感知 Markdown（PyMuPDF find_tables）+ 字段重算引擎
 ├── docx_ops.py     # 占位符提取/替换、书签/页码交叉引用（python-docx 直操 XML）
 ├── index.html      # 前端预览 Demo
+├── setup.sh        # 一键安装 + 启动（装 docker compose/pandoc/依赖/权限）
 ├── start.sh        # 启动脚本 (自动配置 ONLYOFFICE)
 ├── stop.sh         # 停止脚本
 ├── restart.sh      # 重启脚本

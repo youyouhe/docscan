@@ -29,7 +29,7 @@ The frontend ONLYOFFICE viewer is proxied through this server (same-origin
 at /oo/…) so the demo at / also works.
 """
 
-import asyncio, json, os, re, shutil, subprocess, time, uuid, sys
+import asyncio, json, os, re, secrets, shutil, subprocess, time, uuid, sys
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -69,6 +69,59 @@ docx_docs = {}      # {id: metadata}   in-memory, tracks editable docx (see DOCX
 CONVERT_CONCURRENCY = int(os.environ.get('DOCSCAN_CONVERT_CONCURRENCY', '4'))
 _convert_semaphore = asyncio.Semaphore(CONVERT_CONCURRENCY)
 
+# ——— upload size cap (stream-read so a huge body can't OOM us) ———
+MAX_UPLOAD_BYTES = int(os.environ.get('DOCSCAN_MAX_UPLOAD_MB', '100')) * 1024 * 1024
+
+# ——— retention: drop generated files older than N hours on startup (0 = off) ———
+RETENTION_HOURS = int(os.environ.get('DOCSCAN_RETENTION_HOURS', '0'))
+
+async def _read_capped(file):
+    """Read an UploadFile in 1MB chunks, rejecting bodies over MAX_UPLOAD_BYTES
+    (413) instead of slurping the whole thing into memory unbounded."""
+    total, chunks = 0, []
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f'file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)}MB)')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+def _cleanup_old_files():
+    """Delete generated files older than RETENTION_HOURS. Off by default — only
+    runs when an operator opts in via DOCSCAN_RETENTION_HOURS, so we never
+    silently delete a user's data."""
+    if RETENTION_HOURS <= 0:
+        return
+    cutoff = time.time() - RETENTION_HOURS * 3600
+    for d in (PDFS_DIR, MDS_DIR, DOCX_DIR, DOCS_DIR):
+        for p in d.glob('*'):
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
+
+_cleanup_old_files()
+
+# ——— API key: required for all /api/* except health/docs. If none is ——————
+# ——— configured we mint an ephemeral one and print it, so the server never —
+# ——— boots unauthenticated by accident. ————————————————————————————————
+API_KEY = os.environ.get('DOCSCAN_API_KEY') or secrets.token_urlsafe(24)
+# Comma-separated allow-list; '*' (default) stays permissive — but every /api
+# call still needs the key, so a wide CORS no longer means "open".
+CORS_ORIGINS = [o.strip() for o in os.environ.get('DOCSCAN_CORS_ORIGINS', '*').split(',') if o.strip()]
+if not os.environ.get('DOCSCAN_API_KEY'):
+    sys.stderr.write(
+        '\n==============================================================\n'
+        '  No DOCSCAN_API_KEY set — generated ephemeral key:\n'
+        f'      {API_KEY}\n'
+        '  Set DOCSCAN_API_KEY to keep it stable across restarts.\n'
+        '==============================================================\n\n'
+    )
+
 # ═══════════════════════════════════════════════════════════════
 #  App
 # ═══════════════════════════════════════════════════════════════
@@ -78,7 +131,33 @@ app = FastAPI(
     version='1.0',
     docs_url='/api/docs',
 )
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
+
+# Public paths that skip the API key: /api/health (polled by start.sh) and the
+# Swagger/OpenAPI schema endpoints (low-sensitivity, handy to leave open).
+_PUBLIC_API_PATHS = ('/api/health', '/api/docs', '/openapi')
+
+
+def _bearer(header: str) -> str:
+    parts = header.split(None, 1)
+    return parts[1].strip() if len(parts) == 2 and parts[0].lower() == 'bearer' else ''
+
+
+@app.middleware('http')
+async def _require_api_key(request: Request, call_next):
+    """Gate every /api/* route behind DOCSCAN_API_KEY (X-API-Key header or an
+    Authorization: Bearer token). Frontend pages and the ONLYOFFICE reverse
+    proxy are intentionally left open. Registered before the CORS middleware so
+    the latter sits outermost and answers OPTIONS preflights without a key."""
+    path = request.url.path
+    if path.startswith('/api/') and not path.startswith(_PUBLIC_API_PATHS):
+        provided = request.headers.get('x-api-key') or _bearer(request.headers.get('authorization', ''))
+        if not provided or provided != API_KEY:
+            return JSONResponse({'detail': 'invalid or missing API key'}, status_code=401)
+    return await call_next(request)
+
+# Added *after* the key middleware so it wraps it (outermost): CORS preflight
+# OPTIONS requests get answered here and never reach the key check.
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=['*'], allow_headers=['*'])
 
 # ——— helper ———
 def _store(docx_name, pdf_path, pages, page_count):
@@ -106,7 +185,7 @@ async def convert(file: UploadFile = File(description='.docx file')):
     base = uuid.uuid4().hex[:12]
     dx = DOCS_DIR / f'{base}.docx'
     pf = PDFS_DIR / f'{base}.pdf'
-    dx.write_bytes(await file.read())
+    dx.write_bytes(await _read_capped(file))
     loop = asyncio.get_running_loop()
     try:
         async with _convert_semaphore:
@@ -158,6 +237,19 @@ def _docx_path(fid):
         raise HTTPException(404, 'not found')
     return p
 
+def _md_to_docx_sync(md_path, docx_path):
+    """pandoc + docx post-processing. Synchronous and blocking, so callers must
+    offload it to a worker thread (see md2docx below)."""
+    r = subprocess.run(['pandoc', str(md_path), '-o', str(docx_path), '--standalone'],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or 'pandoc exited non-zero')
+    doc = Document(str(docx_path))
+    docx_ops.convert_hr_to_page_breaks(doc)
+    docx_ops.autofit_tables(doc)
+    doc.save(str(docx_path))
+
+
 @app.post('/api/md2docx')
 async def md2docx(file: UploadFile = File(description='.md file')):
     if not file.filename or not file.filename.lower().endswith('.md'):
@@ -165,20 +257,19 @@ async def md2docx(file: UploadFile = File(description='.md file')):
     fid = uuid.uuid4().hex[:10]
     md_path = DOCS_DIR / f'{fid}.md'
     docx_path = DOCX_DIR / f'{fid}.docx'
-    md_path.write_bytes(await file.read())
+    md_path.write_bytes(await _read_capped(file))
+    loop = asyncio.get_running_loop()
     try:
-        r = subprocess.run(['pandoc', str(md_path), '-o', str(docx_path), '--standalone'],
-                            capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip())
+        # pandoc + python-docx are blocking — run them in the thread pool so they
+        # don't freeze uvicorn's event loop (and /api/health) for up to the
+        # pandoc timeout. Shares the convert concurrency cap as back-pressure.
+        async with _convert_semaphore:
+            await loop.run_in_executor(None, _md_to_docx_sync, md_path, docx_path)
     except Exception as e:
         md_path.unlink(missing_ok=True)
+        docx_path.unlink(missing_ok=True)
         raise HTTPException(500, f'md2docx failed: {e}')
     md_path.unlink(missing_ok=True)
-    doc = Document(str(docx_path))
-    docx_ops.convert_hr_to_page_breaks(doc)
-    docx_ops.autofit_tables(doc)
-    doc.save(str(docx_path))
     meta = _docx_meta(fid, file.filename)
     docx_docs[fid] = meta
     return JSONResponse(meta)
@@ -196,7 +287,7 @@ async def upload_docx(file: UploadFile = File(description='.docx file')):
         raise HTTPException(400, 'Only .docx accepted')
     fid = uuid.uuid4().hex[:10]
     docx_path = DOCX_DIR / f'{fid}.docx'
-    docx_path.write_bytes(await file.read())
+    docx_path.write_bytes(await _read_capped(file))
     meta = _docx_meta(fid, file.filename)
     docx_docs[fid] = meta
     return JSONResponse(meta)
