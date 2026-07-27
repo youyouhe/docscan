@@ -8,6 +8,7 @@ docs/
 pdfs/
 mds/
 docx_store/
+owners/
 
 # Logs & PIDs
 *.log
