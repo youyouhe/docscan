@@ -76,6 +76,28 @@ else
     warn "无 .docscan-api-key（若用 DOCSCAN_API_KEY 环境变量启动，以进程环境为准）"
 fi
 
+# ---------- API 端点（动态取自 /openapi.json） ----------
+step "API 端点"
+if spec=$(curl -s -m 3 "$BASE/openapi.json" 2>/dev/null) && [ -n "$spec" ]; then
+    dim "base: $BASE   受保护端点需带 -H \"X-API-Key: \$KEY\""
+    printf '%s' "$spec" | python3 -c 'import sys, json
+base = sys.argv[1]
+d = json.load(sys.stdin)
+public = {"/api/health", "/api/docs"}
+rows = []
+for p in sorted(d.get("paths", {})):
+    ms = [m.upper() for m in d["paths"][p] if m.lower() in ("get", "post", "put", "delete", "patch")]
+    if not ms:
+        continue
+    tag = "  (免key)" if p in public else ("  (页面/代理)" if not p.startswith("/api/") else "")
+    rows.append((",".join(ms), p, tag))
+w = max((len(m) for m, _, _ in rows), default=0)
+for m, p, t in rows:
+    print(f"  {m:<{w}}  {base}{p}{t}")' "$BASE"
+else
+    warn "无法获取 $BASE/openapi.json（服务未起或端口不对）"
+fi
+
 # ---------- 3. 运行中 API 的 DOCSCAN_* 配置 ----------
 step "运行中 API 的 DOCSCAN_* 配置"
 # 配置项及代码默认值（与 api.py 保持一致）；ORDER 决定显示顺序
