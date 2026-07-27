@@ -92,6 +92,30 @@ def _validate_md(data: bytes) -> bytes:
         raise HTTPException(400, '.md file is not valid UTF-8')
     return data
 
+_valid_keys_cache = set()
+_valid_keys_mtime = -1.0
+def _valid_keys():
+    """有效 key 集合：DOCSCAN_API_KEY + .docscan-api-keys 每行（# 注释/空行跳过）。
+    按 mtime 缓存，文件改动后自动刷新——增删 key 无需重启。"""
+    global _valid_keys_cache, _valid_keys_mtime
+    p = ROOT / '.docscan-api-keys'
+    try:
+        m = p.stat().st_mtime
+    except OSError:
+        return {API_KEY}
+    if m != _valid_keys_mtime:
+        keys = {API_KEY}
+        try:
+            for line in p.read_text('utf-8').splitlines():
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    keys.add(line)
+        except OSError:
+            pass
+        _valid_keys_cache = keys
+        _valid_keys_mtime = m
+    return _valid_keys_cache
+
 # ——— data dirs ———
 DOCS_DIR = ROOT / 'docs'
 PDFS_DIR = ROOT / 'pdfs'
@@ -194,8 +218,9 @@ async def _require_api_key(request: Request, call_next):
     # 保护 /api/* 与 /openapi.json（后者不在 /api/ 前缀下，需单独覆盖）
     if (path.startswith('/api/') or path.startswith('/openapi')) and not path.startswith(_PUBLIC_API_PATHS):
         provided = request.headers.get('x-api-key') or _bearer(request.headers.get('authorization', ''))
-        if not provided or provided != API_KEY:
+        if not provided or provided not in _valid_keys():
             return JSONResponse({'detail': 'invalid or missing API key'}, status_code=401)
+        request.state.api_key = provided   # 供下游访问控制（S6）使用
     return await call_next(request)
 
 # ——— per-IP rate limiting (sliding window). Registered before CORS so CORS

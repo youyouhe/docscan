@@ -13,6 +13,7 @@ docx_store/
 *.log
 .docscan*.pid
 .docscan-api-key
+.docscan-api-keys
 .docscan-*.runtime.env
 docscan.env
 

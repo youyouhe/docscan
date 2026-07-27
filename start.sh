@@ -111,6 +111,14 @@ else
     echo "🔐 已生成并保存新的 API Key ($KEY_FILE)"
 fi
 
+# 多 key 列表：首行为主 key；追加更多 key（每行一个，# 注释）即可分发/撤销，热生效
+KEYS_FILE="$SCRIPT_DIR/.docscan-api-keys"
+if [ ! -s "$KEYS_FILE" ]; then
+    printf '%s\n' "$API_KEY" > "$KEYS_FILE"
+    chmod 600 "$KEYS_FILE" 2>/dev/null
+    echo "🔐 初始化 key 列表 $KEYS_FILE（追加 key 每行一个，免重启生效）"
+fi
+
 # ---------- 5. 读取本地配置 (docscan.env，可选) ----------
 ENV_FILE="$SCRIPT_DIR/docscan.env"
 if [ -f "$ENV_FILE" ]; then
