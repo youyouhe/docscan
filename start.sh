@@ -111,13 +111,29 @@ else
     echo "🔐 已生成并保存新的 API Key ($KEY_FILE)"
 fi
 
-# ---------- 5. 启动 FastAPI ----------
+# ---------- 5. 读取本地配置 (docscan.env，可选) ----------
+ENV_FILE="$SCRIPT_DIR/docscan.env"
+if [ -f "$ENV_FILE" ]; then
+    echo "⚙️  读取本地配置 ($ENV_FILE)"
+    set -a
+    . "$ENV_FILE"
+    set +a
+else
+    echo "⚙️  无 docscan.env，使用代码默认（可创建该文件自定义，见 README）"
+fi
+
+# ---------- 6. 启动 FastAPI ----------
 echo "🚀 启动 DocScan API (端口 $PORT)…"
-DOCSCAN_API_KEY="$API_KEY" nohup python3 api.py --port "$PORT" > "$LOG_FILE" 2>&1 &
+# 把生效的 DOCSCAN_* 落盘，供 status.sh 读取（绕过 /proc ptrace 跨会话限制）
+RUNTIME_ENV="$SCRIPT_DIR/.docscan-$PORT.runtime.env"
+{ env | grep '^DOCSCAN_' 2>/dev/null; echo "DOCSCAN_API_KEY=$API_KEY"; } | sort -u > "$RUNTIME_ENV"
+chmod 600 "$RUNTIME_ENV" 2>/dev/null
+# nohup 继承当前 DOCSCAN_*（含 docscan.env）+ 显式 API_KEY
+env DOCSCAN_API_KEY="$API_KEY" nohup python3 api.py --port "$PORT" > "$LOG_FILE" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
 
-# ---------- 6. 验证（检查 JSON 内容，防止误判 MinIO 等） ----------
+# ---------- 7. 验证（检查 JSON 内容，防止误判 MinIO 等） ----------
 for i in $(seq 1 20); do
     RESP=$(curl -s "http://localhost:$PORT/api/health" 2>/dev/null || true)
     if echo "$RESP" | grep -q '"status".*"ok"'; then

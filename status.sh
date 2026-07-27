@@ -76,14 +76,24 @@ else
     warn "无 .docscan-api-key（若用 DOCSCAN_API_KEY 环境变量启动，以进程环境为准）"
 fi
 
-# ---------- 3. 运行中进程的 DOCSCAN_* 环境变量 ----------
-step "运行中 API 的 DOCSCAN_* 环境变量"
+# ---------- 3. 运行中 API 的 DOCSCAN_* 配置 ----------
+step "运行中 API 的 DOCSCAN_* 配置"
+RUNTIME_ENV="$SCRIPT_DIR/.docscan-$PORT.runtime.env"
 if [ -z "$PID" ]; then
     warn "无运行中的 API 进程"
+elif [ -f "$RUNTIME_ENV" ]; then
+    # start.sh 启动时落盘的生效配置（最可靠，不受 ptrace 限制）
+    dim "来源: $RUNTIME_ENV（start.sh 启动时落盘）"
+    shown=0
+    while IFS= read -r line; do
+        case "$line" in DOCSCAN_*) info "$line"; shown=1;; esac
+    done < "$RUNTIME_ENV"
+    [ "$shown" -eq 0 ] && dim "（仅默认值）"
 else
-    # cat 在子 shell 里捕获，2>/dev/null 抑制错误；空结果=读不到（而非"没设置"）
+    # 降级：直接读进程环境（旧版启动或无 runtime.env 时）
     env_raw=$(cat "/proc/$PID/environ" 2>/dev/null || true)
     if [ -n "$env_raw" ]; then
+        dim "来源: /proc/$PID/environ"
         envs=$(printf '%s' "$env_raw" | tr '\0' '\n' | grep '^DOCSCAN_' || true)
         if [ -n "$envs" ]; then
             while IFS= read -r line; do info "$line"; done <<< "$envs"
@@ -91,13 +101,12 @@ else
             dim "进程未设置任何 DOCSCAN_* 变量（全部使用代码默认值）"
         fi
     else
-        # 后台 daemon 不是 status.sh 的子进程 → yama ptrace_scope 阻止跨会话读取
-        warn "/proc/$PID/environ 不可读（Linux ptrace 限制跨会话读取后台进程）"
-        dim "如需查看完整环境变量: sudo tr '\\0' '\\n' < /proc/$PID/environ | grep ^DOCSCAN_"
+        warn "无 runtime.env 且 /proc/$PID/environ 不可读（ptrace 限制）"
         [ -n "$KEY" ] && dim "已知: DOCSCAN_API_KEY=$KEY （来自 .docscan-api-key）"
+        dim "如需完整环境: sudo tr '\\0' '\\n' < /proc/$PID/environ | grep ^DOCSCAN_"
     fi
-    dim "代码默认: API_KEY=随机  CORS_ORIGINS=*  MAX_UPLOAD_MB=100  RETENTION_HOURS=0(关)  CONVERT_CONCURRENCY=4"
 fi
+dim "代码默认: API_KEY=随机  CORS_ORIGINS=*  MAX_UPLOAD_MB=100  RETENTION_HOURS=0(关)  CONVERT_CONCURRENCY=4"
 
 # ---------- 4. ONLYOFFICE ----------
 step "ONLYOFFICE"

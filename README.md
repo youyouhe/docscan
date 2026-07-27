@@ -35,6 +35,24 @@
 - **Python 3.10+** — `pip install -r requirements.txt`（setup 自动）
 - **pandoc** — md→docx 转换（setup 自动 `apt install pandoc`）
 
+## 配置（可选）
+
+在项目根创建 `docscan.env`（已被 `.gitignore` 忽略），写入需要覆盖默认值的环境变量，`start.sh` 启动时自动加载，改后 `./restart.sh` 生效。例如设置产物保留 24 小时：
+
+```bash
+DOCSCAN_RETENTION_HOURS=24
+```
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `DOCSCAN_API_KEY` | 自动生成 | 固定 API Key（不设则存于 `.docscan-api-key`） |
+| `DOCSCAN_CORS_ORIGINS` | `*` | CORS 允许域，逗号分隔 |
+| `DOCSCAN_MAX_UPLOAD_MB` | `100` | 单文件上传上限（超限 413） |
+| `DOCSCAN_RETENTION_HOURS` | `0`(关) | 启动时清理超过 N 小时的产物 |
+| `DOCSCAN_CONVERT_CONCURRENCY` | `4` | ONLYOFFICE 转换并发上限 |
+
+查看运行中进程实际生效的配置：`./status.sh`。
+
 ## API
 
 > **认证**：除 `GET /api/health`、`/api/docs`、`/openapi.json` 外，所有 `/api/*` 接口都需要 API Key——通过请求头 `X-API-Key: <key>` 或 `Authorization: Bearer <key>` 传入。

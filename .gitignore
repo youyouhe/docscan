@@ -13,6 +13,8 @@ docx_store/
 *.log
 .docscan*.pid
 .docscan-api-key
+.docscan-*.runtime.env
+docscan.env
 
 # IDE
 .vscode/
