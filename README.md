@@ -46,7 +46,7 @@ DOCSCAN_RETENTION_HOURS=24
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `DOCSCAN_API_KEY` | 自动生成 | 固定 API Key（不设则存于 `.docscan-api-key`） |
-| `DOCSCAN_CORS_ORIGINS` | `*` | CORS 允许域，逗号分隔 |
+| `DOCSCAN_CORS_ORIGINS` | 空(同源) | CORS 允许域，逗号分隔；公网部署设为具体域 |
 | `DOCSCAN_MAX_UPLOAD_MB` | `100` | 单文件上传上限（超限 413） |
 | `DOCSCAN_RETENTION_HOURS` | `0`(关) | 启动时清理超过 N 小时的产物 |
 | `DOCSCAN_CONVERT_CONCURRENCY` | `4` | ONLYOFFICE 转换并发上限 |

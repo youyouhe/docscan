@@ -8,7 +8,7 @@ services:
     image: onlyoffice/documentserver:latest
     container_name: onlyoffice
     ports:
-      - "8079:80"
+      - "127.0.0.1:8079:80"   # 只绑本地：DocScan 走 localhost 调用，公网不暴露 ONLYOFFICE
     restart: unless-stopped
     environment:
       - JWT_ENABLED=false

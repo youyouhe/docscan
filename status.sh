@@ -76,9 +76,11 @@ else
     warn "无 .docscan-api-key（若用 DOCSCAN_API_KEY 环境变量启动，以进程环境为准）"
 fi
 
-# ---------- API 端点（动态取自 /openapi.json） ----------
+# ---------- API 端点（动态取自 /openapi.json，需 key） ----------
 step "API 端点"
-if spec=$(curl -s -m 3 "$BASE/openapi.json" 2>/dev/null) && [ -n "$spec" ]; then
+AUTH_HDR=()
+[ -n "$KEY" ] && AUTH_HDR=(-H "X-API-Key: $KEY")
+if spec=$(curl -s -m 3 "${AUTH_HDR[@]}" "$BASE/openapi.json" 2>/dev/null) && [ -n "$spec" ]; then
     dim "base: $BASE   受保护端点需带 -H \"X-API-Key: \$KEY\""
     printf '%s' "$spec" | python3 -c 'import sys, json
 base = sys.argv[1]

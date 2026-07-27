@@ -29,7 +29,7 @@ The frontend ONLYOFFICE viewer is proxied through this server (same-origin
 at /oo/…) so the demo at / also works.
 """
 
-import asyncio, json, os, re, secrets, shutil, subprocess, time, uuid, sys
+import asyncio, json, logging, os, re, secrets, shutil, subprocess, time, uuid, sys
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -52,6 +52,15 @@ from server import (
 )
 import docx_ops
 OO_BACKEND = 'http://localhost:8079'   # ONLYOFFICE Docker container
+
+log = logging.getLogger('docscan')
+_FID_RE = re.compile(r'^[0-9a-f]{10,12}$')   # fid = uuid4().hex[:10] 或 [:12]
+
+def _safe_path(base, fid, ext):
+    """base/{fid}.{ext}，校验 fid 为十六进制以防路径遍历（公网加固）。"""
+    if not _FID_RE.match(fid):
+        raise HTTPException(404, 'not found')
+    return base / f'{fid}.{ext}'
 
 # ——— data dirs ———
 DOCS_DIR = ROOT / 'docs'
@@ -110,9 +119,10 @@ _cleanup_old_files()
 # ——— configured we mint an ephemeral one and print it, so the server never —
 # ——— boots unauthenticated by accident. ————————————————————————————————
 API_KEY = os.environ.get('DOCSCAN_API_KEY') or secrets.token_urlsafe(24)
-# Comma-separated allow-list; '*' (default) stays permissive — but every /api
-# call still needs the key, so a wide CORS no longer means "open".
-CORS_ORIGINS = [o.strip() for o in os.environ.get('DOCSCAN_CORS_ORIGINS', '*').split(',') if o.strip()]
+# Comma-separated allow-list of browser origins allowed to call /api cross-site.
+# Default empty = same-origin only (safest for public deploy). Set e.g.
+# DOCSCAN_CORS_ORIGINS=https://app.example.com to open specific origins.
+CORS_ORIGINS = [o.strip() for o in os.environ.get('DOCSCAN_CORS_ORIGINS', '').split(',') if o.strip()]
 if not os.environ.get('DOCSCAN_API_KEY'):
     sys.stderr.write(
         '\n==============================================================\n'
@@ -129,12 +139,14 @@ app = FastAPI(
     title='DocScan API',
     description='Upload .docx → get PDF + per-page Markdown',
     version='1.0',
-    docs_url='/api/docs',
+    docs_url=None,          # 关闭 Swagger UI：公网不暴露交互式文档
+    # openapi.json 仍生成（status.sh 用），但见下方 _PUBLIC_API_PATHS：它也要 key
 )
 
-# Public paths that skip the API key: /api/health (polled by start.sh) and the
-# Swagger/OpenAPI schema endpoints (low-sensitivity, handy to leave open).
-_PUBLIC_API_PATHS = ('/api/health', '/api/docs', '/openapi')
+# Public paths that skip the API key. Only /api/health (polled by start.sh).
+# /openapi.json and the (now-disabled) Swagger UI require the key — don't leak
+# the endpoint schema to anonymous callers on a public deploy.
+_PUBLIC_API_PATHS = ('/api/health',)
 
 
 def _bearer(header: str) -> str:
@@ -149,7 +161,8 @@ async def _require_api_key(request: Request, call_next):
     proxy are intentionally left open. Registered before the CORS middleware so
     the latter sits outermost and answers OPTIONS preflights without a key."""
     path = request.url.path
-    if path.startswith('/api/') and not path.startswith(_PUBLIC_API_PATHS):
+    # 保护 /api/* 与 /openapi.json（后者不在 /api/ 前缀下，需单独覆盖）
+    if (path.startswith('/api/') or path.startswith('/openapi')) and not path.startswith(_PUBLIC_API_PATHS):
         provided = request.headers.get('x-api-key') or _bearer(request.headers.get('authorization', ''))
         if not provided or provided != API_KEY:
             return JSONResponse({'detail': 'invalid or missing API key'}, status_code=401)
@@ -196,17 +209,18 @@ async def convert(file: UploadFile = File(description='.docx file')):
         return JSONResponse(meta)
     except Exception as e:
         dx.unlink(missing_ok=True); pf.unlink(missing_ok=True)
-        raise HTTPException(500, f'Conversion failed: {e}')
+        log.exception('docx→pdf conversion failed')
+        raise HTTPException(500, 'conversion failed (see server logs)')
 
 @app.get('/api/pdf/{fid}')
 def pdf(fid: str):
-    p = PDFS_DIR / f'{fid}.pdf'
+    p = _safe_path(PDFS_DIR, fid, 'pdf')
     if not p.exists(): raise HTTPException(404, 'not found')
     return FileResponse(str(p), media_type='application/pdf', filename=f'{fid}.pdf')
 
 @app.get('/api/md/{fid}')
 def md_all(fid: str):
-    j = MDS_DIR / f'{fid}.json'
+    j = _safe_path(MDS_DIR, fid, 'json')
     if not j.exists(): raise HTTPException(404, 'not found')
     pages = json.loads(j.read_text('utf-8'))
     return dict(id=fid, totalPages=len(pages), pages=pages,
@@ -214,7 +228,7 @@ def md_all(fid: str):
 
 @app.get('/api/md/{fid}/{page}')
 def md_page(fid: str, page: int):
-    j = MDS_DIR / f'{fid}.json'
+    j = _safe_path(MDS_DIR, fid, 'json')
     if not j.exists(): raise HTTPException(404, 'not found')
     pages = json.loads(j.read_text('utf-8'))
     if page < 1 or page > len(pages): raise HTTPException(404, f'page {page} out of range')
@@ -232,7 +246,7 @@ def _docx_meta(fid, file_name):
                 created=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
 
 def _docx_path(fid):
-    p = DOCX_DIR / f'{fid}.docx'
+    p = _safe_path(DOCX_DIR, fid, 'docx')
     if not p.exists():
         raise HTTPException(404, 'not found')
     return p
@@ -268,7 +282,8 @@ async def md2docx(file: UploadFile = File(description='.md file')):
     except Exception as e:
         md_path.unlink(missing_ok=True)
         docx_path.unlink(missing_ok=True)
-        raise HTTPException(500, f'md2docx failed: {e}')
+        log.exception('md2docx failed')
+        raise HTTPException(500, 'md2docx failed (see server logs)')
     md_path.unlink(missing_ok=True)
     meta = _docx_meta(fid, file.filename)
     docx_docs[fid] = meta
@@ -361,7 +376,8 @@ async def add_crossref(fid: str, body: CrossrefRequest):
         shutil.move(str(recalced), str(p))
     except Exception as e:
         recalced.unlink(missing_ok=True)
-        raise HTTPException(500, f'page recalculation failed: {e}')
+        log.exception('page recalculation failed')
+        raise HTTPException(500, 'page recalculation failed (see server logs)')
 
     return dict(id=fid, bookmark=bookmark, cellPath=body.cellPath)
 
