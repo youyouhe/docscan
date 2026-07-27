@@ -56,11 +56,41 @@ OO_BACKEND = 'http://localhost:8079'   # ONLYOFFICE Docker container
 log = logging.getLogger('docscan')
 _FID_RE = re.compile(r'^[0-9a-f]{10,12}$')   # fid = uuid4().hex[:10] 或 [:12]
 
+# ——— per-IP rate limits (sliding 60s window) & upload content guards ———
+RATE_WINDOW = 60
+RATE_READ = int(os.environ.get('DOCSCAN_RATE_READ', '60'))    # GET / IP / 分钟
+RATE_WRITE = int(os.environ.get('DOCSCAN_RATE_WRITE', '10'))  # POST 等 / IP / 分钟
+DOCX_MAX_UNCOMPRESSED = int(os.environ.get('DOCSCAN_DOCX_MAX_UNCOMPRESSED_MB', '200')) * 1024 * 1024
+
 def _safe_path(base, fid, ext):
     """base/{fid}.{ext}，校验 fid 为十六进制以防路径遍历（公网加固）。"""
     if not _FID_RE.match(fid):
         raise HTTPException(404, 'not found')
     return base / f'{fid}.{ext}'
+
+def _validate_docx(data: bytes) -> bytes:
+    """Reject non-ZIP or zip-bomb .docx uploads."""
+    if not data.startswith(b'PK\x03\x04'):
+        raise HTTPException(400, 'not a valid .docx (ZIP) file')
+    import io, zipfile
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+        total = sum(zi.file_size for zi in zf.infolist())
+        n = len(zf.namelist())
+    except Exception:
+        raise HTTPException(400, 'corrupt .docx archive')
+    if total > DOCX_MAX_UNCOMPRESSED:
+        raise HTTPException(400, 'docx uncompressed size too large')
+    if n > 10000:
+        raise HTTPException(400, 'docx has too many entries')
+    return data
+
+def _validate_md(data: bytes) -> bytes:
+    try:
+        data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise HTTPException(400, '.md file is not valid UTF-8')
+    return data
 
 # ——— data dirs ———
 DOCS_DIR = ROOT / 'docs'
@@ -168,8 +198,33 @@ async def _require_api_key(request: Request, call_next):
             return JSONResponse({'detail': 'invalid or missing API key'}, status_code=401)
     return await call_next(request)
 
-# Added *after* the key middleware so it wraps it (outermost): CORS preflight
-# OPTIONS requests get answered here and never reach the key check.
+# ——— per-IP rate limiting (sliding window). Registered before CORS so CORS
+# sits outermost (answers preflight); rate_limit wraps the key check. ———
+_rate_store = {}
+
+@app.middleware('http')
+async def _rate_limit(request: Request, call_next):
+    """Writes (POST/PUT/PATCH) are capped tighter than reads. Behind a reverse
+    proxy set DOCSCAN_TRUSTED_PROXY=1 so we trust X-Forwarded-For."""
+    ip = request.client.host if request.client else ''
+    if os.environ.get('DOCSCAN_TRUSTED_PROXY'):
+        xff = request.headers.get('x-forwarded-for', '')
+        if xff:
+            ip = xff.split(',')[0].strip()
+    if ip:
+        now = time.monotonic()
+        bucket = [t for t in _rate_store.get(ip, []) if now - t < RATE_WINDOW]
+        limit = RATE_WRITE if request.method in ('POST', 'PUT', 'PATCH') else RATE_READ
+        if len(bucket) >= limit:
+            return JSONResponse({'detail': 'rate limit exceeded, retry later'}, status_code=429)
+        bucket.append(now)
+        _rate_store[ip] = bucket
+        if len(_rate_store) > 50000:   # guard against unbounded IP-table growth
+            _rate_store.clear()
+    return await call_next(request)
+
+# Added *after* the key + rate-limit middlewares so CORS sits outermost and
+# answers OPTIONS preflights without consuming a rate-limit slot.
 app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=['*'], allow_headers=['*'])
 
 # ——— helper ———
@@ -198,7 +253,7 @@ async def convert(file: UploadFile = File(description='.docx file')):
     base = uuid.uuid4().hex[:12]
     dx = DOCS_DIR / f'{base}.docx'
     pf = PDFS_DIR / f'{base}.pdf'
-    dx.write_bytes(await _read_capped(file))
+    dx.write_bytes(_validate_docx(await _read_capped(file)))
     loop = asyncio.get_running_loop()
     try:
         async with _convert_semaphore:
@@ -271,7 +326,7 @@ async def md2docx(file: UploadFile = File(description='.md file')):
     fid = uuid.uuid4().hex[:10]
     md_path = DOCS_DIR / f'{fid}.md'
     docx_path = DOCX_DIR / f'{fid}.docx'
-    md_path.write_bytes(await _read_capped(file))
+    md_path.write_bytes(_validate_md(await _read_capped(file)))
     loop = asyncio.get_running_loop()
     try:
         # pandoc + python-docx are blocking — run them in the thread pool so they
@@ -302,7 +357,7 @@ async def upload_docx(file: UploadFile = File(description='.docx file')):
         raise HTTPException(400, 'Only .docx accepted')
     fid = uuid.uuid4().hex[:10]
     docx_path = DOCX_DIR / f'{fid}.docx'
-    docx_path.write_bytes(await _read_capped(file))
+    docx_path.write_bytes(_validate_docx(await _read_capped(file)))
     meta = _docx_meta(fid, file.filename)
     docx_docs[fid] = meta
     return JSONResponse(meta)
