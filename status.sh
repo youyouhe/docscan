@@ -78,35 +78,49 @@ fi
 
 # ---------- 3. 运行中 API 的 DOCSCAN_* 配置 ----------
 step "运行中 API 的 DOCSCAN_* 配置"
+# 配置项及代码默认值（与 api.py 保持一致）；ORDER 决定显示顺序
+declare -A DEFAULTS=(
+    [DOCSCAN_API_KEY]="<自动生成>"
+    [DOCSCAN_CORS_ORIGINS]="*"
+    [DOCSCAN_MAX_UPLOAD_MB]="100"
+    [DOCSCAN_RETENTION_HOURS]="0 (关)"
+    [DOCSCAN_CONVERT_CONCURRENCY]="4"
+)
+ORDER=(DOCSCAN_API_KEY DOCSCAN_CORS_ORIGINS DOCSCAN_MAX_UPLOAD_MB DOCSCAN_RETENTION_HOURS DOCSCAN_CONVERT_CONCURRENCY)
+
+# 读取实际生效值：优先 runtime.env，降级 /proc/environ
+declare -A ACTUAL=()
 RUNTIME_ENV="$SCRIPT_DIR/.docscan-$PORT.runtime.env"
+SRC=""
 if [ -z "$PID" ]; then
-    warn "无运行中的 API 进程"
+    warn "无运行中的 API 进程（下方为代码默认值）"
 elif [ -f "$RUNTIME_ENV" ]; then
-    # start.sh 启动时落盘的生效配置（最可靠，不受 ptrace 限制）
-    dim "来源: $RUNTIME_ENV（start.sh 启动时落盘）"
-    shown=0
-    while IFS= read -r line; do
-        case "$line" in DOCSCAN_*) info "$line"; shown=1;; esac
+    SRC="$RUNTIME_ENV（start.sh 启动时落盘）"
+    while IFS='=' read -r k v; do
+        case "$k" in DOCSCAN_*) ACTUAL["$k"]="$v";; esac
     done < "$RUNTIME_ENV"
-    [ "$shown" -eq 0 ] && dim "（仅默认值）"
 else
-    # 降级：直接读进程环境（旧版启动或无 runtime.env 时）
     env_raw=$(cat "/proc/$PID/environ" 2>/dev/null || true)
     if [ -n "$env_raw" ]; then
-        dim "来源: /proc/$PID/environ"
-        envs=$(printf '%s' "$env_raw" | tr '\0' '\n' | grep '^DOCSCAN_' || true)
-        if [ -n "$envs" ]; then
-            while IFS= read -r line; do info "$line"; done <<< "$envs"
-        else
-            dim "进程未设置任何 DOCSCAN_* 变量（全部使用代码默认值）"
-        fi
+        SRC="/proc/$PID/environ"
+        while IFS= read -r line; do
+            k=${line%%=*}; v=${line#*=}
+            case "$k" in DOCSCAN_*) ACTUAL["$k"]="$v";; esac
+        done <<< "$(printf '%s' "$env_raw" | tr '\0' '\n')"
     else
-        warn "无 runtime.env 且 /proc/$PID/environ 不可读（ptrace 限制）"
-        [ -n "$KEY" ] && dim "已知: DOCSCAN_API_KEY=$KEY （来自 .docscan-api-key）"
-        dim "如需完整环境: sudo tr '\\0' '\\n' < /proc/$PID/environ | grep ^DOCSCAN_"
+        warn "无 runtime.env 且 /proc 不可读（ptrace 限制），下方为默认值"
     fi
 fi
-dim "代码默认: API_KEY=随机  CORS_ORIGINS=*  MAX_UPLOAD_MB=100  RETENTION_HOURS=0(关)  CONVERT_CONCURRENCY=4"
+[ -n "$SRC" ] && dim "来源: $SRC"
+
+# 统一表：每项 = 实际值，标注「已设置(覆盖默认)」或「默认」
+for k in "${ORDER[@]}"; do
+    if [ -n "${ACTUAL[$k]+x}" ]; then
+        printf '  %s%-28s = %s%s  %s(已设置)%s\n' "$C_CYAN" "$k" "${ACTUAL[$k]}" "$C_RESET" "$C_YELLOW" "$C_RESET"
+    else
+        printf '  %s%-28s = %s  (默认)%s\n' "$C_DIM" "$k" "${DEFAULTS[$k]}" "$C_RESET"
+    fi
+done
 
 # ---------- 4. ONLYOFFICE ----------
 step "ONLYOFFICE"
