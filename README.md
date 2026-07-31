@@ -199,6 +199,44 @@ curl -X POST http://localhost:8800/api/docx/e73911e954/crossref \
 }
 ```
 
+### `POST /api/docx/{id}/apply-style`
+上传一个**样本 `.docx`**（格式模板），把样本里的**标题样式**（heading 1–4，按大纲级别 `outlineLvl` 跨文档配对）和**正文样式**（`Normal` / `Body Text`）套用到目标文档（`{id}`），就地写回。同时同步样本的**主题字体**（`theme1.xml` 的 majorFont/minorFont），确保 `majorHAnsi` 等主题字体引用解析一致。
+
+套用前自动备份原文件为 `{id}.docx.bak`（仅首次套用时创建，可回滚）；套用失败则恢复原文件。
+
+**配对机制**：标题按 `outlineLvl`（0/1/2/3…）匹配——不依赖两文档的 styleId 或命名是否相同（样本 `styleId="2"` 的 `heading 1` ↔ 目标 `Heading1`）；正文按语义名（`Normal`/`Body Text`/`段落正文`…）匹配。因此样本与目标的样式体系不同也能正确套用。
+
+```bash
+curl -X POST http://localhost:8800/api/docx/e73911e954/apply-style \
+  -H "X-API-Key: <你的key>" \
+  -F "sample=@template.docx"
+```
+
+响应（`applied` 列出实际套用了哪些角色；`themeFontsSynced` / `docDefaultsSynced` 表示主题字体与文档默认字体基准是否同步成功）：
+```json
+{
+  "id": "e73911e954",
+  "fileName": "document.docx",
+  "docxUrl": "/api/docx/e73911e954",
+  "applied": [
+    {"role": "heading", "targetId": "Heading1", "sampleId": "2", "sampleName": "heading 1"},
+    {"role": "heading", "targetId": "Heading2", "sampleId": "3", "sampleName": "heading 2"},
+    {"role": "body", "targetId": "Normal", "sampleId": "1", "sampleName": "Normal"},
+    {"role": "body", "targetId": "BodyText", "sampleId": "10", "sampleName": "Body Text"}
+  ],
+  "themeFontsSynced": true,
+  "docDefaultsSynced": true,
+  "numberingSynced": true
+}
+```
+
+**字体同步（三层）**：为完整复现样本字体，引擎同步字体链路的三层——① 各标题/正文样式的 rPr（合并保留目标原有的 rFonts 主题绑定，避免回退默认字体）；② `docDefaults/rPrDefault/rPr/rFonts` 文档默认字体基准（含显式中文字体名，如样本指定「黑体」则目标继承「黑体」）；③ `theme1.xml` 的 majorFont/minorFont（主题字体槽位，如 Calibri/宋体）。
+
+**effective 格式**：样本常以 run 级直接格式（在工具栏改字号）覆盖样式定义——引擎取「样式定义 + 代表段落的直接格式」合并为实际渲染外观再套用，避免只搬定义导致字号/加粗与样本所见不符。
+
+**标题编号套用**：若样本标题采用自动编号（`<w:numPr>`，如 `1.`/`1.1.`/`1.1.1.` 多级编号），引擎把 `numbering.xml` 的 `abstractNum`/`num` 定义搬到目标（id 重映射避免冲突），并将 numPr 提升为样式级绑定（H1–H4 自动编号）。判定规则：每个标题层级的**首个段落**决定该级是否编号，且编号必须从顶层（ol=0）连续——父级无编号时子级编号会断裂，不予套用。样本为文本编号（"第一章"/"一、" 写在正文里）则返回 `numberingSynced: false`，不强加自动编号。
+套用后用 `GET /api/docx/{id}` 下载即为新外观文档。常用搭配：`md2docx`（生成内容）→ `apply-style`（统一外观）→ `replace` / `crossref`（填占位符、加交叉引用）。
+
 ## 工作原理
 
 ```
@@ -227,6 +265,7 @@ docscan/
 ├── api.py          # FastAPI 服务
 ├── server.py       # docx→pdf 转换引擎（ONLYOFFICE）+ PDF→表格感知 Markdown（PyMuPDF find_tables）+ 字段重算引擎
 ├── docx_ops.py     # 占位符提取/替换、书签/页码交叉引用（python-docx 直操 XML）
+├── style_ops.py    # 样式套用引擎（按 outlineLvl 跨文档配对标题/正文样式 + 主题字体同步）
 ├── index.html      # 前端预览 Demo
 ├── setup.sh        # 一键安装 + 启动（装 docker compose/pandoc/依赖/权限）
 ├── start.sh        # 启动脚本 (自动配置 ONLYOFFICE)

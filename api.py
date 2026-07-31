@@ -52,6 +52,7 @@ from server import (
     _recalculate_fields_docx,
 )
 import docx_ops
+import style_ops
 OO_BACKEND = 'http://localhost:8079'   # ONLYOFFICE Docker container
 
 log = logging.getLogger('docscan')
@@ -529,8 +530,59 @@ async def add_crossref(fid: str, body: CrossrefRequest, request: Request):
         recalced.unlink(missing_ok=True)
         log.exception('page recalculation failed')
         raise HTTPException(500, 'page recalculation failed (see server logs)')
-
     return dict(id=fid, bookmark=bookmark, cellPath=body.cellPath)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Apply styles from a sample docx (heading + body) onto a stored docx
+#  — reuses the same fid/owner model as replace/crossref.
+# ═══════════════════════════════════════════════════════════════
+
+@app.post('/api/docx/{fid}/apply-style')
+async def apply_style(fid: str, request: Request,
+                      sample: UploadFile = File(description='样式样本 .docx')):
+    """Transfer heading + body paragraph styles from `sample` onto the stored
+    target docx (fid), rewriting it in place so subsequent GETs reflect the
+    new look. Writes a {fid}.docx.bak backup first (rollback on failure).
+
+    Pairing is role-based: headings pair by outlineLvl (0..N) across the two
+    documents regardless of styleId/name drift; body pairs by semantic name.
+    Theme fonts (majorFont/minorFont) are synced so themeFont refs resolve.
+    """
+    _assert_owner(fid, request)
+    p = _docx_path(fid)
+    if not sample.filename or not sample.filename.lower().endswith('.docx'):
+        raise HTTPException(400, 'Only .docx accepted as sample')
+    sample_bytes = _validate_docx(await _read_capped(sample))
+    sp = DOCX_DIR / f'{fid}-sample.docx'
+    sp.write_bytes(sample_bytes)
+
+    # Snapshot the *original* target before mutating, so we can roll back on
+    # failure and the user can recover the pre-style file. Only the first
+    # application creates the .bak — repeat applies keep the oldest original.
+    bak = p.with_suffix('.docx.bak')
+    created_bak = False
+    if not bak.exists():
+        shutil.copy2(str(p), str(bak))
+        created_bak = True
+    try:
+        loop = asyncio.get_running_loop()
+        # python-docx load/mutate/save + zip theme rewrite are blocking.
+        result = await loop.run_in_executor(None, style_ops.apply_sample_styles, p, sp)
+    except Exception as e:
+        if created_bak:                      # restore the untouched original
+            shutil.move(str(bak), str(p))
+        log.exception('apply-style failed')
+        raise HTTPException(500, 'style application failed (see server logs)')
+    finally:
+        sp.unlink(missing_ok=True)
+    meta = _docx_meta(fid, p.name)
+    docx_docs[fid] = meta
+    return JSONResponse(dict(id=fid, fileName=p.name, docxUrl=f'/api/docx/{fid}',
+                             applied=result['applied'],
+                             themeFontsSynced=result['themeFontsSynced'],
+                             docDefaultsSynced=result['docDefaultsSynced'],
+                             numberingSynced=result['numberingSynced']))
 
 # ═══════════════════════════════════════════════════════════════
 #  Frontend demo  ( / → index.html )
