@@ -471,12 +471,28 @@ def _find_keyword_in_paragraph(doc, keyword, paragraph_path):
     return paragraph, pos, pos + len(keyword)
 
 
+def _next_bookmark_id(paragraph):
+    """Return a bookmark id strictly greater than every existing
+    <w:bookmarkStart> id in the document, so ids stay unique as OOXML
+    requires. Previously we used abs(hash(name)) % 1e6, which (a) collides
+    once a doc has many bookmarks and (b) is randomized per process via
+    PYTHONHASHSEED — a collision sends a PAGEREF field at the wrong bookmark
+    and bakes the wrong page number into the cell."""
+    max_id = 0
+    for el in paragraph._p.getroottree().iter(qn('w:bookmarkStart')):
+        try:
+            max_id = max(max_id, int(el.get(qn('w:id'))))
+        except (TypeError, ValueError):
+            continue
+    return str(max_id + 1)
+
+
 def _wrap_bookmark(paragraph, start, end, bookmark_name):
     """Insert <w:bookmarkStart>/<w:bookmarkEnd> around paragraph.text[start:end]
     by splitting whichever run(s) the span touches, so the bookmark markers
     sit exactly at the span boundaries.
     """
-    bookmark_id = str(abs(hash(bookmark_name)) % 1000000)
+    bookmark_id = _next_bookmark_id(paragraph)
 
     start_elem = _make_bookmark_elem('w:bookmarkStart', bookmark_id, bookmark_name)
     end_elem = _make_bookmark_elem('w:bookmarkEnd', bookmark_id, None)

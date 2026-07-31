@@ -30,6 +30,7 @@ at /oo/…) so the demo at / also works.
 """
 
 import asyncio, json, logging, os, re, secrets, shutil, subprocess, time, uuid, sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -121,15 +122,28 @@ def _record_owner(fid, key):
     if key:
         (OWNERS_DIR / f'{fid}.owner').write_text(key, 'utf-8')
 
+def _owner_of(fid):
+    """fid 的归属 key；无记录返回 None。调用方负责先校验 fid 格式
+    （见 _assert_owner / list_conv），本函数只负责读。"""
+    p = OWNERS_DIR / f'{fid}.owner'
+    try:
+        return p.read_text('utf-8').strip() or None
+    except OSError:
+        return None
+
 def _assert_owner(fid, request):
-    """访问校验：仅 owner key 可操作该 fid；无归属记录(旧文件)→ 404。"""
+    """访问校验：仅 owner key 可操作该 fid；无归属记录(旧文件)→ 404。
+    先把 fid 校验为十六进制，防止被用来路径穿越到 OWNERS_DIR 之外——
+    _safe_path 也校验，但它在调用处排在 _assert_owner 之后，得各报各的。"""
+    if not _FID_RE.match(fid):
+        raise HTTPException(404, 'not found')
     key = getattr(request.state, 'api_key', None)
     if not key:
         return
-    p = OWNERS_DIR / f'{fid}.owner'
-    if not p.exists():
+    owner = _owner_of(fid)
+    if owner is None:
         raise HTTPException(404, 'not found')
-    if p.read_text('utf-8').strip() != key:
+    if owner != key:
         raise HTTPException(403, 'forbidden')
 
 # ——— data dirs ———
@@ -148,6 +162,28 @@ docx_docs = {}      # {id: metadata}   in-memory, tracks editable docx (see DOCX
 # 避免卡住 uvicorn 的单个事件循环；并发数上限防止把 ONLYOFFICE 转换 worker 打爆。
 CONVERT_CONCURRENCY = int(os.environ.get('DOCSCAN_CONVERT_CONCURRENCY', '4'))
 _convert_semaphore = asyncio.Semaphore(CONVERT_CONCURRENCY)
+# 有界排队（背压）：执行中(CONVERT_CONCURRENCY) + 排队等待(MAX_QUEUED) 之外
+# 的请求立即 503，避免突发流量下无限排队、把内存/连接撑爆。信号量只卡"同时
+# 执行"，挡不住"无限排队"——这里给排队也设上限。
+MAX_QUEUED = int(os.environ.get('DOCSCAN_MAX_QUEUED', '10'))
+_concurrent_or_queued = 0   # 执行中 + 排队中的总数
+
+@asynccontextmanager
+async def _convert_slot():
+    """占一个转换名额（正在执行或在信号量前排队），离开时归还。名额满
+    （超过 并发 + 排队上限）直接 503，把"无限排队"变成"有界排队"。
+
+    _concurrent_or_queued 的检查与自增之间无 await，在 asyncio 单线程里对
+    协程天然原子，无需加锁；被 503 的请求在自增前就 raise，不占名额。"""
+    global _concurrent_or_queued
+    if _concurrent_or_queued >= CONVERT_CONCURRENCY + MAX_QUEUED:
+        raise HTTPException(503, 'server busy: conversion queue full, retry later')
+    _concurrent_or_queued += 1
+    try:
+        async with _convert_semaphore:   # 在此排队等执行名额
+            yield
+    finally:
+        _concurrent_or_queued -= 1
 
 # ——— upload size cap (stream-read so a huge body can't OOM us) ———
 MAX_UPLOAD_BYTES = int(os.environ.get('DOCSCAN_MAX_UPLOAD_MB', '100')) * 1024 * 1024
@@ -298,7 +334,7 @@ async def convert(request: Request, file: UploadFile = File(description='.docx f
     dx.write_bytes(_validate_docx(await _read_capped(file)))
     loop = asyncio.get_running_loop()
     try:
-        async with _convert_semaphore:
+        async with _convert_slot():
             n = await loop.run_in_executor(None, _convert_docx_to_pdf, dx, pf)
             pages = await loop.run_in_executor(None, _extract_pdf_pages, pf)
         meta = _store(file.filename, pf, pages, n or len(pages))
@@ -336,7 +372,13 @@ def md_page(fid: str, page: int, request: Request):
     return dict(id=fid, page=page, totalPages=len(pages), markdown=pages[page-1])
 
 @app.get('/api/conversions')
-def list_conv(): return list(conversions.values())
+def list_conv(request: Request):
+    """仅返回当前 key 归属的转换记录——多 key 场景下不互相可见
+    （修复此前整表泄露 id/fileName 元数据的问题）。"""
+    key = getattr(request.state, 'api_key', None)
+    if not key:
+        return list(conversions.values())   # 中间件已强制 key，此处仅兜底
+    return [m for m in conversions.values() if _owner_of(m.get('id')) == key]
 
 # ═══════════════════════════════════════════════════════════════
 #  md → docx, and docx placeholder/crossref editing
@@ -377,8 +419,8 @@ async def md2docx(request: Request, file: UploadFile = File(description='.md fil
     try:
         # pandoc + python-docx are blocking — run them in the thread pool so they
         # don't freeze uvicorn's event loop (and /api/health) for up to the
-        # pandoc timeout. Shares the convert concurrency cap as back-pressure.
-        async with _convert_semaphore:
+        # pandoc timeout. Shares the convert slot (concurrency cap + queue cap).
+        async with _convert_slot():
             await loop.run_in_executor(None, _md_to_docx_sync, md_path, docx_path)
     except Exception as e:
         md_path.unlink(missing_ok=True)
@@ -480,7 +522,7 @@ async def add_crossref(fid: str, body: CrossrefRequest, request: Request):
     loop = asyncio.get_running_loop()
     recalced = DOCX_DIR / f'{fid}-recalc.docx'
     try:
-        async with _convert_semaphore:
+        async with _convert_slot():
             await loop.run_in_executor(None, _recalculate_fields_docx, p, recalced)
         shutil.move(str(recalced), str(p))
     except Exception as e:

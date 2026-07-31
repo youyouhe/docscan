@@ -50,6 +50,7 @@ DOCSCAN_RETENTION_HOURS=24
 | `DOCSCAN_MAX_UPLOAD_MB` | `100` | 单文件上传上限（超限 413） |
 | `DOCSCAN_RETENTION_HOURS` | `0`(关) | 启动时清理超过 N 小时的产物 |
 | `DOCSCAN_CONVERT_CONCURRENCY` | `4` | ONLYOFFICE 转换并发上限 |
+| `DOCSCAN_MAX_QUEUED` | `10` | 排队等待上限（背压）：执行中 + 排队超过此数立即 503 |
 
 查看运行中进程实际生效的配置：`./status.sh`。
 
