@@ -161,7 +161,7 @@ docx_docs = {}      # {id: metadata}   in-memory, tracks editable docx (see DOCX
 
 # 转换是同步阻塞调用（subprocess + httpx.Client），丢进线程池跑，
 # 避免卡住 uvicorn 的单个事件循环；并发数上限防止把 ONLYOFFICE 转换 worker 打爆。
-CONVERT_CONCURRENCY = int(os.environ.get('DOCSCAN_CONVERT_CONCURRENCY', '4'))
+CONVERT_CONCURRENCY = int(os.environ.get('DOCSCAN_CONVERT_CONCURRENCY', '8'))
 _convert_semaphore = asyncio.Semaphore(CONVERT_CONCURRENCY)
 # 有界排队（背压）：执行中(CONVERT_CONCURRENCY) + 排队等待(MAX_QUEUED) 之外
 # 的请求立即 503，避免突发流量下无限排队、把内存/连接撑爆。信号量只卡"同时
@@ -279,12 +279,14 @@ async def _require_api_key(request: Request, call_next):
 
 # ——— per-IP rate limiting (sliding window). Registered before CORS so CORS
 # sits outermost (answers preflight); rate_limit wraps the key check. ———
-_rate_store = {}
+_rate_store = {}   # {ip: {'read': [...ts], 'write': [...ts]}}
 
 @app.middleware('http')
 async def _rate_limit(request: Request, call_next):
-    """Writes (POST/PUT/PATCH) are capped tighter than reads. Behind a reverse
-    proxy set DOCSCAN_TRUSTED_PROXY=1 so we trust X-Forwarded-For."""
+    """Writes (POST/PUT/PATCH) are capped tighter than reads, and read/write
+    quotas are tracked in SEPARATE buckets so GET traffic (health polls,
+    get_md fetches) never burns the write budget. Behind a reverse proxy set
+    DOCSCAN_TRUSTED_PROXY=1 so we trust X-Forwarded-For."""
     ip = request.client.host if request.client else ''
     if os.environ.get('DOCSCAN_TRUSTED_PROXY'):
         xff = request.headers.get('x-forwarded-for', '')
@@ -292,12 +294,14 @@ async def _rate_limit(request: Request, call_next):
             ip = xff.split(',')[0].strip()
     if ip:
         now = time.monotonic()
-        bucket = [t for t in _rate_store.get(ip, []) if now - t < RATE_WINDOW]
-        limit = RATE_WRITE if request.method in ('POST', 'PUT', 'PATCH') else RATE_READ
-        if len(bucket) >= limit:
+        kind = 'write' if request.method in ('POST', 'PUT', 'PATCH') else 'read'
+        buckets = _rate_store.setdefault(ip, {'read': [], 'write': []})
+        win = [t for t in buckets[kind] if now - t < RATE_WINDOW]
+        limit = RATE_WRITE if kind == 'write' else RATE_READ
+        if len(win) >= limit:
             return JSONResponse({'detail': 'rate limit exceeded, retry later'}, status_code=429)
-        bucket.append(now)
-        _rate_store[ip] = bucket
+        win.append(now)
+        buckets[kind] = win
         if len(_rate_store) > 50000:   # guard against unbounded IP-table growth
             _rate_store.clear()
     return await call_next(request)
