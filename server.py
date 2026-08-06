@@ -31,7 +31,12 @@ onlyoffice/documentserver:latest container (JWT disabled).
 """
 
 import http.server
+import json
+import logging
+import os
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -43,6 +48,8 @@ try:
     import fitz  # PyMuPDF
 except ImportError:  # very new pymupdf may drop the fitz alias
     import pymupdf as fitz
+
+log = logging.getLogger(__name__)
 
 OO_BACKEND = 'http://localhost:8079'   # ONLYOFFICE container, host-facing port
 CONTAINER = 'onlyoffice'                # docker container name
@@ -253,9 +260,79 @@ def _request_docbuilder(script):
 # ════════════════════════════════════════════════════════════════════
 #  PDF -> per-page text (Markdown-ish, table-aware)
 # ════════════════════════════════════════════════════════════════════
+# ── process isolation for PDF extraction ──────────────────────────────
+# PyMuPDF's page.find_tables() can fall into a CPU-bound pathological loop on
+# certain pages and, being a C extension, holds the GIL the whole time. This
+# function is invoked via loop.run_in_executor(), so a GIL-hogging worker used
+# to starve uvicorn's event loop and freeze the whole service (2026-08-06
+# outage). We now run the extraction in a separate *process*: the child has its
+# own GIL, so even a runaway find_tables() only burns the child; a hard timeout
+# SIGKILLs it and we degrade to plain-text extraction rather than failing.
+_EXTRACT_TIMEOUT = float(os.environ.get('DOCSCAN_EXTRACT_TIMEOUT', '120'))
+
+
 def _extract_pdf_pages(pdf_path):
-    """Extract per-page Markdown from a PDF; return list[str] (one string per
-    page, ordered, 1-indexed by position). Pages that are image-only yield ''.
+    """Per-page Markdown via PyMuPDF — run in an isolated subprocess with a
+    hard timeout, so a pathological find_tables() can never freeze the main
+    process through GIL starvation. On timeout or any failure we degrade to
+    plain-text extraction (no find_tables) instead of failing the conversion.
+    Returns list[str], one Markdown string per page.
+    """
+    pdf_path = str(pdf_path)
+    # Result comes back via a temp file, NOT stdout: PyMuPDF prints a
+    # "Consider using the pymupdf_layout package ..." hint to stdout from
+    # find_tables(), which would corrupt a stdout-based JSON stream.
+    _script = (
+        "import sys, json; "
+        "from server import _extract_pdf_pages_inproc; "
+        "json.dump(_extract_pdf_pages_inproc(sys.argv[1]), open(sys.argv[2], 'w'), ensure_ascii=False)"
+    )
+    fd, tmp = tempfile.mkstemp(suffix='.json', prefix='docscan-extract-')
+    os.close(fd)
+    try:
+        try:
+            r = subprocess.run(
+                [sys.executable, '-c', _script, pdf_path, tmp],
+                capture_output=True, timeout=_EXTRACT_TIMEOUT,
+                cwd=str(Path(__file__).parent),
+            )
+            if r.returncode == 0 and os.path.getsize(tmp) > 0:
+                with open(tmp, encoding='utf-8') as f:
+                    return json.load(f)
+            log.warning('pdf extract subprocess failed rc=%s stderr=%s',
+                        r.returncode, (r.stderr or b'').decode('utf-8', 'replace')[-400:])
+        except subprocess.TimeoutExpired:
+            # subprocess.run already SIGKILLed the child before raising.
+            log.warning('pdf extract timed out after %ss, falling back to plain text',
+                        _EXTRACT_TIMEOUT)
+        except Exception:
+            log.exception('pdf extract wrapper error, falling back to plain text')
+        return _extract_pdf_pages_plain(pdf_path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _extract_pdf_pages_plain(pdf_path):
+    """Degraded extraction: plain text per page, no find_tables() — cannot hit
+    the GIL-hogging path. Safe fallback when the subprocess times out or fails.
+    """
+    pages = []
+    try:
+        with fitz.open(str(pdf_path)) as doc:
+            for page in doc:
+                pages.append(_tidy(page.get_text('text') or ''))
+    except Exception:
+        log.exception('plain pdf extract failed for %s', pdf_path)
+    return pages
+
+
+def _extract_pdf_pages_inproc(pdf_path):
+    """The real extraction logic (tables + text). Called from a child process
+    via _extract_pdf_pages; kept here so the child reuses it by importing this
+    module instead of duplicating code. Returns list[str], one per page.
 
     Tables are detected via PyMuPDF's find_tables() and rendered as GFM
     pipe-tables so row/column structure survives (scoring tables, quotation
