@@ -765,6 +765,7 @@ def _append_pageref_field(cell, bookmark_name):
     fld_end = OxmlElement('w:fldChar')
     fld_end.set(qn('w:fldCharType'), 'end')
 
+    p_elem.append(make_run(text_content='、'))   # separator between anchors sharing one cell (第1页、第2页)
     p_elem.append(make_run(text_content='第'))
     p_elem.append(make_run([fld_begin]))
     p_elem.append(make_run([instr]))
@@ -775,17 +776,22 @@ def _append_pageref_field(cell, bookmark_name):
 
 
 def _clear_cell_pagerefs(doc, cell):
-    """Tear down the PAGEREF fields already sitting in the cell's first
-    paragraph AND the body bookmarks they reference, so re-inserting into the
-    cell (the replace path) is fully idempotent — without this, every re-run
-    leaves the previous run's body bookmarks behind as orphans, since
-    _insert_pageref_field only clears the cell's runs, not the body bookmarks.
+    """Tear down what a previous insert left in this cell so re-inserting (the
+    replace path) is fully idempotent across re-runs. Two things, both needed:
 
-    Only bookmarks whose name appears in one of the cell's existing PAGEREF
-    instructions are removed; unrelated bookmarks elsewhere are untouched.
+    1. The body bookmarks the cell's existing PAGEREF fields point at — without
+       this they'd survive as orphans (the cell clean-up below doesn't touch the
+       body). Only bookmarks whose name appears in one of the cell's PAGEREF
+       instructions are removed; unrelated bookmarks elsewhere are untouched.
+    2. The cell paragraph's field runs + rendered values — but NOT any label
+       text before the first field. Without this, _insert_pageref_field
+       captures the stale rendered text ("第1页…") as its prefix and re-emits
+       it as dead text, so every re-run lengthens the cell even though the
+       field count stays constant.
 
-    Reads the cell BEFORE _insert_pageref_field clears its runs (that erases the
-    instrText we parse), so call this immediately before _insert_pageref_field.
+    No-op on a first-ever insert (no PAGEREF in the cell yet), so the initial
+    replace still honours a 第　　页 placeholder. Call immediately before
+    _insert_pageref_field — it parses the instrText the run clean-up erases.
     """
     p_elem = cell.paragraphs[0]._p
     names = set()
@@ -805,3 +811,19 @@ def _clear_cell_pagerefs(doc, cell):
     for el in list(root.iter(qn('w:bookmarkEnd'))):
         if el.get(qn('w:id')) in ids_to_remove:
             el.getparent().remove(el)
+    # Drop the cell's field runs + rendered values + wrappers, but KEEP any
+    # label text before the first field — so a label cell like "接口设计：第12页"
+    # reruns to "接口设计：第<new>页" instead of losing the label. The run right
+    # before the first field is that field's '第' prefix; drop it too.
+    runs = list(p_elem.findall(qn('w:r')))
+    first_field = next((i for i, r in enumerate(runs)
+                        if r.find(qn('w:fldChar')) is not None), None)
+    if first_field is None:
+        return
+    keep_upto = first_field
+    if keep_upto > 0:
+        prev_t = runs[keep_upto - 1].find(qn('w:t'))
+        if prev_t is not None and (prev_t.text or '').strip() == '第':
+            keep_upto -= 1
+    for r in runs[keep_upto:]:
+        p_elem.remove(r)
