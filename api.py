@@ -537,6 +537,59 @@ async def add_crossref(fid: str, body: CrossrefRequest, request: Request):
     return dict(id=fid, bookmark=bookmark, cellPath=body.cellPath)
 
 
+class CrossrefBatchItem(BaseModel):
+    keyword: str
+    cellPath: str
+    paragraphPath: str | None = None
+
+
+class CrossrefBatchRequest(BaseModel):
+    items: list[CrossrefBatchItem]
+    recalc: bool | None = None            # 默认 True:插入完成后做一次 ONLYOFFICE 重算
+    continueOnError: bool | None = None   # 默认 True:单条失败不中断批次
+
+
+def _crossref_batch_sync(p, items, continue_on_error):
+    """线程池里跑:打开 doc → 批量插入 → 保存。不重算。打开/保存失败会抛
+    (批次级致命,由路由转 500)。整段同步 CPU 工作必须脱离事件循环。"""
+    doc = Document(str(p))
+    results = docx_ops.add_page_crossref_batch(doc, items, continue_on_error)
+    doc.save(str(p))
+    return results
+
+
+@app.post('/api/docx/{fid}/crossref_batch')
+async def add_crossref_batch(fid: str, body: CrossrefBatchRequest, request: Request):
+    _assert_owner(fid, request)
+    p = _docx_path(fid)
+    if not body.items:                    # 空批次不重算
+        return dict(id=fid, total=0, succeeded=0, failed=0, recalc='skipped', items=[])
+
+    do_recalc = True if body.recalc is None else body.recalc
+    coe = True if body.continueOnError is None else body.continueOnError
+
+    loop = asyncio.get_running_loop()
+    results = await loop.run_in_executor(           # 整段 CPU 工作脱离事件循环(硬性)
+        None, _crossref_batch_sync, p,
+        [it.model_dump() for it in body.items], coe)
+
+    succeeded = sum(1 for r in results if r.get('status') == 'ok')
+    recalc_status = 'skipped'
+    if do_recalc and succeeded > 0:                 # 有成功项才需重算
+        recalced = DOCX_DIR / f'{fid}-recalc.docx'
+        try:
+            async with _convert_slot():
+                await loop.run_in_executor(None, _recalculate_fields_docx, p, recalced)
+            shutil.move(str(recalced), str(p))
+            recalc_status = 'ok'
+        except Exception:
+            recalced.unlink(missing_ok=True)
+            log.exception('batch page recalculation failed')
+            recalc_status = 'failed'                # 不抛 500:保留已插入域,交调用方决策
+    return dict(id=fid, total=len(results), succeeded=succeeded,
+                failed=len(results) - succeeded, recalc=recalc_status, items=results)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  Apply styles from a sample docx (heading + body) onto a stored docx
 #  — reuses the same fid/owner model as replace/crossref.

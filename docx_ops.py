@@ -10,6 +10,7 @@ objects (callers own load/save):
     replace_placeholders(doc, {id: value})      -> int (count replaced)
     list_tables(doc)                            -> list[TableInfo]
     add_page_crossref(doc, keyword, cell_path, paragraph_path=None)  -> bookmark name
+    add_page_crossref_batch(doc, items, continue_on_error=True)      -> list[result dict]
     list_body_paragraphs(doc)                   -> list[str]  (for previewing)
     autofit_tables(doc, page_width=None)        -> int (count of tables resized)
     convert_hr_to_page_breaks(doc)              -> int (count of `---` converted to page breaks)
@@ -394,45 +395,130 @@ def _resolve_cell(doc, cell_path):
 #  PAGEREF field in the target cell. Raw OOXML — python-docx has no
 #  built-in bookmark/field API.
 # ════════════════════════════════════════════════════════════════════
+def _paragraph_paths_containing(doc, keyword):
+    """['paragraph[N]', ...] for every body paragraph whose text contains
+    keyword, using the SAME raw enumerate(doc.iter_inner_content()) index as
+    list_body_paragraphs / _find_body_keyword_all — so a returned path can be
+    fed straight back in as paragraph_path."""
+    return [f'paragraph[{i}]' for i, item in enumerate(doc.iter_inner_content())
+            if isinstance(item, Paragraph) and item.text.find(keyword) != -1]
+
+
+def _apply_single_crossref(doc, keyword, cell_path, paragraph_path=None, bookmark_id=None):
+    """Core of one cross-ref insertion: locate keyword, resolve the target
+    cell, wrap a bookmark around the keyword. Does NOT insert the PAGEREF
+    field — the caller picks replace vs append (see add_page_crossref /
+    add_page_crossref_batch).
+
+    Returns a structured dict, never raises:
+        ok      -> {status, cell, bookmark, cellPath}
+        failure -> {status, detail?, candidates?}   status ∈
+                   keyword_not_found | ambiguous | bad_paragraph_path | bad_cell_path
+
+    Ordering deliberately resolves cell_path BEFORE wrapping the bookmark, so a
+    bad cell_path can't leave an orphan bookmark behind (relevant under
+    continueOnError, where a later save would persist it).
+    """
+    try:
+        if paragraph_path is not None:
+            target_paragraph, start, end = _find_keyword_in_paragraph(doc, keyword, paragraph_path)
+            if target_paragraph is None:
+                return dict(status='keyword_not_found',
+                            detail=f'keyword {keyword!r} not found in {paragraph_path}')
+        else:
+            matches = _find_body_keyword_all(doc, keyword)
+            if not matches:
+                return dict(status='keyword_not_found',
+                            detail=f'keyword not found in document body: {keyword!r}')
+            if len(matches) > 1:
+                return dict(status='ambiguous',
+                            detail=f'keyword {keyword!r} matches {len(matches)} paragraphs — '
+                                   'pass paragraphPath to disambiguate',
+                            candidates=_paragraph_paths_containing(doc, keyword))
+            target_paragraph, start, end = matches[0]
+    except ValueError as e:
+        return dict(status='bad_paragraph_path', detail=str(e))
+
+    try:
+        cell = _resolve_cell(doc, cell_path)
+    except ValueError as e:
+        return dict(status='bad_cell_path', detail=str(e))
+
+    bookmark_name = f'bm_{uuid.uuid4().hex[:12]}'
+    _wrap_bookmark(target_paragraph, start, end, bookmark_name, bookmark_id=bookmark_id)
+    return dict(status='ok', cell=cell, bookmark=bookmark_name, cellPath=cell_path)
+
+
 def add_page_crossref(doc, keyword, cell_path, paragraph_path=None):
     """Bookmark an occurrence of `keyword` in the document body, then insert
     a PAGEREF field pointing at that bookmark into the target cell (see
     list_tables for path format).
 
-    If `paragraph_path` is given (e.g. "paragraph[5]", from list_body_paragraphs),
-    the match is taken from that specific paragraph — this is how a caller
-    disambiguates when `keyword` occurs more than once in the body. Without
-    it, the keyword must be unique across the whole body; 0 matches raises
-    "not found", 2+ matches raises "ambiguous" (callers should have the user
-    pick a paragraph and pass paragraph_path instead of guessing).
+    Single-item path: always replace (clears the cell's first paragraph and
+    rebuilds). If `paragraph_path` is given (e.g. "paragraph[5]", from
+    list_body_paragraphs), the match is taken from that specific paragraph —
+    this is how a caller disambiguates when `keyword` occurs more than once.
+    Without it, the keyword must be unique across the body; 0 matches raises
+    "not found", 2+ matches raises "ambiguous".
 
     Returns the bookmark name. Raises ValueError on no-match/ambiguous-match/
-    bad cell_path.
-
-    Page numbers only become correct after the caller round-trips the saved
-    document through server.py's `_recalculate_fields_docx`.
+    bad cell_path. Page numbers only become correct after the caller round-
+    trips the saved document through server.py's `_recalculate_fields_docx`.
     """
-    if paragraph_path is not None:
-        target_paragraph, start, end = _find_keyword_in_paragraph(doc, keyword, paragraph_path)
-        if target_paragraph is None:
-            raise ValueError(f'keyword {keyword!r} not found in {paragraph_path}')
-    else:
-        matches = _find_body_keyword_all(doc, keyword)
-        if not matches:
-            raise ValueError(f'keyword not found in document body: {keyword!r}')
-        if len(matches) > 1:
-            raise ValueError(
-                f'keyword {keyword!r} matches {len(matches)} paragraphs — '
-                'pass paragraph_path to disambiguate which occurrence to bookmark'
-            )
-        target_paragraph, start, end = matches[0]
+    r = _apply_single_crossref(doc, keyword, cell_path, paragraph_path)
+    if r['status'] != 'ok':
+        raise ValueError(r.get('detail') or r['status'])
+    _clear_cell_pagerefs(doc, r['cell'])   # idempotent re-insert: drop old field's body bookmark too
+    _insert_pageref_field(r['cell'], r['bookmark'])
+    return r['bookmark']
 
-    bookmark_name = f'bm_{uuid.uuid4().hex[:12]}'
-    _wrap_bookmark(target_paragraph, start, end, bookmark_name)
 
-    cell = _resolve_cell(doc, cell_path)
-    _insert_pageref_field(cell, bookmark_name)
-    return bookmark_name
+def add_page_crossref_batch(doc, items, continue_on_error=True):
+    """Insert many cross-refs in one pass over an already-open doc (caller
+    owns load/save). `items` is a list of dicts {keyword, cellPath, paragraphPath?}.
+
+    Within one cellPath, the FIRST successful item replaces (clears+rebuilds
+    the cell's first paragraph) and every later successful item APPENDS a
+    第[field]页 unit at the tail — so one cell can hold several jump targets
+    (multi-anchor per cell). Re-running the same batch is idempotent: the
+    first item's replace clears the prior anchors (including previous appends)
+    before they're re-stacked, so the field count stays constant.
+
+    Grouping is by *successful* insert count per cellPath, not item position:
+    if item 2 fails, item 3 becomes that cell's 2nd anchor and appends.
+
+    Returns a list of result dicts (one per item, in order), each with `index`
+    plus either {status:'ok', bookmark, cellPath, mode:'replace'|'append'} or
+    {status, detail?, candidates?}. Single-item failures become statuses, not
+    exceptions; under continue_on_error=False the first failure aborts the
+    rest as status:'skipped'. Failures leave no orphan bookmark.
+    """
+    results = []
+    next_id = _max_bookmark_id(doc._element) + 1
+    seen = {}  # cellPath -> count of anchors already inserted
+    for idx, it in enumerate(items):
+        r = _apply_single_crossref(doc, it.get('keyword'), it.get('cellPath'),
+                                   it.get('paragraphPath'), bookmark_id=str(next_id))
+        if r['status'] == 'ok':
+            next_id += 1  # only a successful bookmark consumes an id
+            cp = it.get('cellPath')
+            if seen.get(cp, 0) == 0:
+                _clear_cell_pagerefs(doc, r['cell'])   # idempotent re-run: clear old fields' body bookmarks before rebuild
+                _insert_pageref_field(r['cell'], r['bookmark'])
+                r['mode'] = 'replace'
+            else:
+                _append_pageref_field(r['cell'], r['bookmark'])
+                r['mode'] = 'append'
+            seen[cp] = seen.get(cp, 0) + 1
+            del r['cell']  # docx object — don't leak into the JSON response
+        r['index'] = idx
+        results.append(r)
+        if r['status'] != 'ok' and not continue_on_error:
+            for j in range(idx + 1, len(items)):
+                results.append(dict(index=j, status='skipped',
+                                    detail='batch aborted: earlier item failed'))
+            break
+    return results
 
 
 def _find_body_keyword_all(doc, keyword):
@@ -471,6 +557,21 @@ def _find_keyword_in_paragraph(doc, keyword, paragraph_path):
     return paragraph, pos, pos + len(keyword)
 
 
+def _max_bookmark_id(root):
+    """Max existing <w:bookmarkStart> id under `root`, or 0 if none. `root` is
+    anything lxml-iterable spanning the whole document — a doc element
+    (doc._element) for the batch path, or a paragraph's getroottree() for the
+    single-item path. Shared so the batch path can pre-scan once instead of
+    re-scanning the whole document per item."""
+    max_id = 0
+    for el in root.iter(qn('w:bookmarkStart')):
+        try:
+            max_id = max(max_id, int(el.get(qn('w:id'))))
+        except (TypeError, ValueError):
+            continue
+    return max_id
+
+
 def _next_bookmark_id(paragraph):
     """Return a bookmark id strictly greater than every existing
     <w:bookmarkStart> id in the document, so ids stay unique as OOXML
@@ -478,21 +579,20 @@ def _next_bookmark_id(paragraph):
     once a doc has many bookmarks and (b) is randomized per process via
     PYTHONHASHSEED — a collision sends a PAGEREF field at the wrong bookmark
     and bakes the wrong page number into the cell."""
-    max_id = 0
-    for el in paragraph._p.getroottree().iter(qn('w:bookmarkStart')):
-        try:
-            max_id = max(max_id, int(el.get(qn('w:id'))))
-        except (TypeError, ValueError):
-            continue
-    return str(max_id + 1)
+    return str(_max_bookmark_id(paragraph._p.getroottree()) + 1)
 
 
-def _wrap_bookmark(paragraph, start, end, bookmark_name):
+def _wrap_bookmark(paragraph, start, end, bookmark_name, bookmark_id=None):
     """Insert <w:bookmarkStart>/<w:bookmarkEnd> around paragraph.text[start:end]
     by splitting whichever run(s) the span touches, so the bookmark markers
     sit exactly at the span boundaries.
+
+    bookmark_id may be supplied by a batch caller that pre-scanned the max id
+    once and increments in memory (avoids a per-item full-document scan); when
+    omitted, the next free id is computed from the document.
     """
-    bookmark_id = _next_bookmark_id(paragraph)
+    if bookmark_id is None:
+        bookmark_id = _next_bookmark_id(paragraph)
 
     start_elem = _make_bookmark_elem('w:bookmarkStart', bookmark_id, bookmark_name)
     end_elem = _make_bookmark_elem('w:bookmarkEnd', bookmark_id, None)
@@ -626,3 +726,82 @@ def _insert_pageref_field(cell, bookmark_name):
     p_elem.append(make_run(text_content='页'))
     if suffix:
         p_elem.append(make_run(text_content=suffix))
+
+
+def _append_pageref_field(cell, bookmark_name):
+    """Append a PAGEREF field (wrapped in 第...页) to the END of the cell's
+    first paragraph WITHOUT touching existing runs. Used for the 2nd..Nth
+    cross-ref sharing one cell (multi-anchor per cell).
+
+    Unlike _insert_pageref_field this is pure append — no placeholder parsing,
+    no run clearing — so it's simpler. The first anchor's replace pass already
+    consumed any 第　　页 placeholder; subsequent anchors just stack extra
+    第[field]页 units at the tail. Re-run idempotency comes from the first
+    anchor's replace clearing the paragraph (including these appends) first.
+    """
+    from docx.oxml import OxmlElement
+    p_elem = cell.paragraphs[0]._p
+
+    def make_run(children=None, text_content=None):
+        r = OxmlElement('w:r')
+        if text_content is not None:
+            t = OxmlElement('w:t')
+            t.set(qn('xml:space'), 'preserve')
+            t.text = text_content
+            r.append(t)
+        for child in (children or []):
+            r.append(child)
+        return r
+
+    fld_begin = OxmlElement('w:fldChar')
+    fld_begin.set(qn('w:fldCharType'), 'begin')
+    instr = OxmlElement('w:instrText')
+    instr.set(qn('xml:space'), 'preserve')
+    instr.text = f' PAGEREF {bookmark_name} \\h '
+    fld_separate = OxmlElement('w:fldChar')
+    fld_separate.set(qn('w:fldCharType'), 'separate')
+    placeholder_text = OxmlElement('w:t')
+    placeholder_text.text = '1'
+    fld_end = OxmlElement('w:fldChar')
+    fld_end.set(qn('w:fldCharType'), 'end')
+
+    p_elem.append(make_run(text_content='第'))
+    p_elem.append(make_run([fld_begin]))
+    p_elem.append(make_run([instr]))
+    p_elem.append(make_run([fld_separate]))
+    p_elem.append(make_run([placeholder_text]))
+    p_elem.append(make_run([fld_end]))
+    p_elem.append(make_run(text_content='页'))
+
+
+def _clear_cell_pagerefs(doc, cell):
+    """Tear down the PAGEREF fields already sitting in the cell's first
+    paragraph AND the body bookmarks they reference, so re-inserting into the
+    cell (the replace path) is fully idempotent — without this, every re-run
+    leaves the previous run's body bookmarks behind as orphans, since
+    _insert_pageref_field only clears the cell's runs, not the body bookmarks.
+
+    Only bookmarks whose name appears in one of the cell's existing PAGEREF
+    instructions are removed; unrelated bookmarks elsewhere are untouched.
+
+    Reads the cell BEFORE _insert_pageref_field clears its runs (that erases the
+    instrText we parse), so call this immediately before _insert_pageref_field.
+    """
+    p_elem = cell.paragraphs[0]._p
+    names = set()
+    for instr in p_elem.iter(qn('w:instrText')):
+        m = re.search(r'PAGEREF\s+(\S+)', instr.text or '')
+        if m:
+            names.add(m.group(1))
+    if not names:
+        return  # first-ever insert into this cell — nothing to clean
+
+    root = doc._element
+    ids_to_remove = set()
+    for el in list(root.iter(qn('w:bookmarkStart'))):
+        if el.get(qn('w:name')) in names:
+            ids_to_remove.add(el.get(qn('w:id')))
+            el.getparent().remove(el)
+    for el in list(root.iter(qn('w:bookmarkEnd'))):
+        if el.get(qn('w:id')) in ids_to_remove:
+            el.getparent().remove(el)
