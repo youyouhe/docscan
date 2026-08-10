@@ -269,55 +269,82 @@ def _request_docbuilder(script):
 # own GIL, so even a runaway find_tables() only burns the child; a hard timeout
 # SIGKILLs it and we degrade to plain-text extraction rather than failing.
 _EXTRACT_TIMEOUT = float(os.environ.get('DOCSCAN_EXTRACT_TIMEOUT', '120'))
+# Plain-text fallback gets a shorter leash: if even get_text() is pathological
+# we want to give up fast rather than tie up a child process.
+_PLAIN_EXTRACT_TIMEOUT = float(os.environ.get('DOCSCAN_PLAIN_EXTRACT_TIMEOUT', '30'))
 
 
-def _extract_pdf_pages(pdf_path):
-    """Per-page Markdown via PyMuPDF — run in an isolated subprocess with a
-    hard timeout, so a pathological find_tables() can never freeze the main
-    process through GIL starvation. On timeout or any failure we degrade to
-    plain-text extraction (no find_tables) instead of failing the conversion.
-    Returns list[str], one Markdown string per page.
+def _extract_in_subprocess(pdf_path, func_name, timeout):
+    """Run server.<func_name>(pdf_path) in an isolated child process with a hard
+    timeout; return its list[str] result, or None on timeout/failure.
+
+    Every PyMuPDF text operation (find_tables, get_text, get_textpage) can turn
+    into a CPU-bound pathological loop on certain PDFs and, being a C extension,
+    hold the GIL the whole time. So NONE of them may run in the main process's
+    thread pool — that starves the event loop and freezes the service
+    (2026-08-06 and 2026-08-10 outages). The child has its own GIL; a hard
+    timeout SIGKILLs it; the main process stays responsive. Result comes back via
+    a temp file because PyMuPDF prints a "Consider using pymupdf_layout ..." hint
+    to stdout, which would corrupt a stdout JSON stream.
     """
-    pdf_path = str(pdf_path)
-    # Result comes back via a temp file, NOT stdout: PyMuPDF prints a
-    # "Consider using the pymupdf_layout package ..." hint to stdout from
-    # find_tables(), which would corrupt a stdout-based JSON stream.
     _script = (
         "import sys, json; "
-        "from server import _extract_pdf_pages_inproc; "
-        "json.dump(_extract_pdf_pages_inproc(sys.argv[1]), open(sys.argv[2], 'w'), ensure_ascii=False)"
-    )
+        "from server import %s; "
+        "json.dump(%s(sys.argv[1]), open(sys.argv[2], 'w'), ensure_ascii=False)"
+    ) % (func_name, func_name)
     fd, tmp = tempfile.mkstemp(suffix='.json', prefix='docscan-extract-')
     os.close(fd)
     try:
         try:
             r = subprocess.run(
                 [sys.executable, '-c', _script, pdf_path, tmp],
-                capture_output=True, timeout=_EXTRACT_TIMEOUT,
+                capture_output=True, timeout=timeout,
                 cwd=str(Path(__file__).parent),
             )
             if r.returncode == 0 and os.path.getsize(tmp) > 0:
                 with open(tmp, encoding='utf-8') as f:
                     return json.load(f)
-            log.warning('pdf extract subprocess failed rc=%s stderr=%s',
-                        r.returncode, (r.stderr or b'').decode('utf-8', 'replace')[-400:])
+            log.warning('%s subprocess failed rc=%s stderr=%s',
+                        func_name, r.returncode,
+                        (r.stderr or b'').decode('utf-8', 'replace')[-300:])
         except subprocess.TimeoutExpired:
             # subprocess.run already SIGKILLed the child before raising.
-            log.warning('pdf extract timed out after %ss, falling back to plain text',
-                        _EXTRACT_TIMEOUT)
+            log.warning('%s timed out after %ss', func_name, timeout)
         except Exception:
-            log.exception('pdf extract wrapper error, falling back to plain text')
-        return _extract_pdf_pages_plain(pdf_path)
+            log.exception('%s wrapper error', func_name)
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+    return None
+
+
+def _extract_pdf_pages(pdf_path):
+    """Per-page Markdown via PyMuPDF — fully process-isolated so a pathological
+    PDF can never freeze the event loop. Try full extraction (tables) in a child
+    process; on timeout/failure try plain-text extraction in another child
+    process; if that also fails, return [] so the conversion still succeeds
+    (with empty Markdown) rather than hanging the service. The main process
+    NEVER calls PyMuPDF directly.
+    """
+    pdf_path = str(pdf_path)
+    pages = _extract_in_subprocess(pdf_path, '_extract_pdf_pages_inproc', _EXTRACT_TIMEOUT)
+    if pages is not None:
+        return pages
+    log.warning('full pdf extract failed/timed out, trying plain-text in subprocess')
+    pages = _extract_in_subprocess(pdf_path, '_extract_pdf_pages_plain', _PLAIN_EXTRACT_TIMEOUT)
+    if pages is not None:
+        return pages
+    log.warning('plain pdf extract also failed; returning empty pages (conversion still succeeds)')
+    return []
 
 
 def _extract_pdf_pages_plain(pdf_path):
-    """Degraded extraction: plain text per page, no find_tables() — cannot hit
-    the GIL-hogging path. Safe fallback when the subprocess times out or fails.
+    """Degraded extraction: plain text per page (no find_tables). Still a PyMuPDF
+    C-extension call — get_text() shares the same textpage path that can turn
+    pathological — so it MUST run via _extract_in_subprocess, never in the main
+    process, or it starves the event loop exactly like find_tables did.
     """
     pages = []
     try:
