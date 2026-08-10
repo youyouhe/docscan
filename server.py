@@ -269,9 +269,10 @@ def _request_docbuilder(script):
 # own GIL, so even a runaway find_tables() only burns the child; a hard timeout
 # SIGKILLs it and we degrade to plain-text extraction rather than failing.
 _EXTRACT_TIMEOUT = float(os.environ.get('DOCSCAN_EXTRACT_TIMEOUT', '120'))
-# Plain-text fallback gets a shorter leash: if even get_text() is pathological
-# we want to give up fast rather than tie up a child process.
-_PLAIN_EXTRACT_TIMEOUT = float(os.environ.get('DOCSCAN_PLAIN_EXTRACT_TIMEOUT', '30'))
+# Layer 2: pdfplumber (pure Python, cannot hang like the C textpage) — slower, tighter cap.
+_PDFPLUMBER_TIMEOUT = float(os.environ.get('DOCSCAN_PDFPLUMBER_TIMEOUT', '60'))
+# Layer 3: pdftotext (poppler) plain-text last resort.
+_PDFTOTEXT_TIMEOUT = float(os.environ.get('DOCSCAN_PDFTOTEXT_TIMEOUT', '30'))
 
 
 def _extract_in_subprocess(pdf_path, func_name, timeout):
@@ -321,39 +322,58 @@ def _extract_in_subprocess(pdf_path, func_name, timeout):
 
 
 def _extract_pdf_pages(pdf_path):
-    """Per-page Markdown via PyMuPDF — fully process-isolated so a pathological
-    PDF can never freeze the event loop. Try full extraction (tables) in a child
-    process; on timeout/failure try plain-text extraction in another child
-    process; if that also fails, return [] so the conversion still succeeds
-    (with empty Markdown) rather than hanging the service. The main process
-    NEVER calls PyMuPDF directly.
+    """Per-page Markdown — three-layer fallback, each layer a DIFFERENT engine so
+    a pathological page that hangs one engine is handled by the next. Every layer
+    runs in an isolated child process with a hard timeout; the main process never
+    calls any PDF engine directly.
+
+      1. PyMuPDF find_tables (C, fast, table-aware) — normal PDFs finish here.
+      2. pdfplumber (pure Python, cannot hang like the C textpage) — same
+         table+text output, used when PyMuPDF times out on a pathological PDF.
+      3. pdftotext (poppler, independent C impl) — plain text, last resort.
+      4. [] — conversion still succeeds with empty Markdown.
     """
     pdf_path = str(pdf_path)
     pages = _extract_in_subprocess(pdf_path, '_extract_pdf_pages_inproc', _EXTRACT_TIMEOUT)
     if pages is not None:
         return pages
-    log.warning('full pdf extract failed/timed out, trying plain-text in subprocess')
-    pages = _extract_in_subprocess(pdf_path, '_extract_pdf_pages_plain', _PLAIN_EXTRACT_TIMEOUT)
+    log.warning('pymupdf extract failed/timed out, falling back to pdfplumber')
+    pages = _extract_in_subprocess(pdf_path, '_extract_pdf_pages_pdfplumber', _PDFPLUMBER_TIMEOUT)
     if pages is not None:
         return pages
-    log.warning('plain pdf extract also failed; returning empty pages (conversion still succeeds)')
+    log.warning('pdfplumber extract failed/timed out, falling back to pdftotext')
+    pages = _extract_pdf_pages_pdftotext(pdf_path)
+    if pages is not None:
+        return pages
+    log.warning('all extraction layers failed; returning empty pages (conversion still succeeds)')
     return []
 
 
-def _extract_pdf_pages_plain(pdf_path):
-    """Degraded extraction: plain text per page (no find_tables). Still a PyMuPDF
-    C-extension call — get_text() shares the same textpage path that can turn
-    pathological — so it MUST run via _extract_in_subprocess, never in the main
-    process, or it starves the event loop exactly like find_tables did.
-    """
-    pages = []
+def _extract_pdf_pages_pdftotext(pdf_path):
+    """Layer 3: poppler's pdftotext. Independent C implementation that does NOT
+    share PyMuPDF's textpage hang. Plain text only (no table structure), pages
+    separated by \\f. Last resort when PyMuPDF and pdfplumber both fail."""
     try:
-        with fitz.open(str(pdf_path)) as doc:
-            for page in doc:
-                pages.append(_tidy(page.get_text('text') or ''))
+        r = subprocess.run(
+            ['pdftotext', str(pdf_path), '-'],
+            capture_output=True, timeout=_PDFTOTEXT_TIMEOUT,
+        )
+        if r.returncode != 0 or not r.stdout:
+            log.warning('pdftotext failed rc=%s', r.returncode)
+            return None
+        pages = r.stdout.decode('utf-8', 'replace').split('\f')
+        if pages and not pages[-1].strip():   # trailing \f yields an empty segment
+            pages.pop()
+        return [_tidy(p) for p in pages]
+    except FileNotFoundError:
+        log.warning('pdftotext not installed (poppler-utils); skipping layer 3')
+        return None
+    except subprocess.TimeoutExpired:
+        log.warning('pdftotext timed out after %ss', _PDFTOTEXT_TIMEOUT)
+        return None
     except Exception:
-        log.exception('plain pdf extract failed for %s', pdf_path)
-    return pages
+        log.exception('pdftotext wrapper error')
+        return None
 
 
 def _extract_pdf_pages_inproc(pdf_path):
@@ -371,6 +391,67 @@ def _extract_pdf_pages_inproc(pdf_path):
         for page in doc:
             pages.append(_tidy(_page_to_markdown(page)))
     return pages
+
+
+def _extract_pdf_pages_pdfplumber(pdf_path):
+    """Layer 2: pdfplumber extraction (tables + text). Pure Python — it can be
+    slow but cannot hang like PyMuPDF's C textpage, so it reliably handles
+    pathological PDFs. Same output shape as _extract_pdf_pages_inproc."""
+    import pdfplumber  # lazy: not a hard dependency, only layer 2 needs it
+    pages = []
+    try:
+        with pdfplumber.open(str(pdf_path)) as doc:
+            for page in doc.pages:
+                pages.append(_tidy(_page_to_markdown_pdfplumber(page)))
+    except Exception:
+        log.exception('pdfplumber extract failed for %s', pdf_path)
+    return pages
+
+
+def _page_to_markdown_pdfplumber(page):
+    """pdfplumber mirror of _page_to_markdown. Reuses _drop_nested_tables and
+    _table_to_markdown (they only touch .bbox and .extract(), which pdfplumber
+    Table objects also provide). Text is rebuilt from extract_words() so it can
+    be interleaved with tables by vertical position, skipping words inside any
+    table region."""
+    from collections import defaultdict
+    try:
+        tables = page.find_tables() or []
+    except Exception:
+        tables = []
+    tables = _drop_nested_tables(tables)
+    if not tables:
+        return page.extract_text() or ''
+
+    def _in_table(w):
+        wx, wy = w['x0'], w['top']
+        for t in tables:
+            x0, top, x1, bot = t.bbox
+            if x0 - 2 <= wx <= x1 + 2 and top - 2 <= wy <= bot + 2:
+                return True
+        return False
+
+    words = page.extract_words(use_text_flow=True) or []
+    lines = defaultdict(list)
+    for w in words:
+        if _in_table(w):
+            continue
+        lines[round(w['top'] / 3) * 3].append((w['x0'], w['text']))
+
+    items = [(y, 'text', ' '.join(t for _, t in sorted(ws))) for y, ws in lines.items()]
+    items += [(t.bbox[1], 'table', t) for t in tables]
+    items.sort(key=lambda it: it[0])
+
+    parts = []
+    for _, kind, payload in items:
+        if kind == 'text':
+            if payload.strip():
+                parts.append(payload)
+        else:
+            md = _table_to_markdown(payload)
+            if md:
+                parts.append(md)
+    return '\n\n'.join(parts)
 
 
 def _drop_nested_tables(tables, tol=2.0):
